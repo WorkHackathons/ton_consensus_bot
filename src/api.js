@@ -268,10 +268,12 @@ export default function createApiRouter(bot) {
     upsertUser(result.data.opponent_id, result.data.username ?? null);
     joinBet(betId, result.data.opponent_id);
     const joinedBet = getBet(betId);
+    const opponentUser = getUser(result.data.opponent_id);
+    const opponentLabel = opponentUser?.username ? `@${opponentUser.username}` : "Your opponent";
     await safeNotify(
       bot,
       bet.creator_id,
-      `⚡️ Your challenge was accepted.\n\nUser #${result.data.opponent_id} is now inside the Mini App and waiting for you to complete the deposit step.`,
+      `⚡️ Your challenge was accepted.\n\n${opponentLabel} is now inside the Mini App and waiting for you to complete the deposit step.`,
     );
     return res.json({ ok: true, bet: joinedBet });
   });
