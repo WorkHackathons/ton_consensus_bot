@@ -36,6 +36,7 @@ if (!token) {
 const bot = new Telegraf(token);
 const TONSCAN = process.env.NETWORK === "mainnet" ? "https://tonscan.org" : "https://testnet.tonscan.org";
 const ARBITER_INVITE_IMAGE = "https://github.com/WorkHackathons/ton_consensus_bot/blob/main/photo_2026-03-20_23-19-26.jpg?raw=true";
+const arbiterInviteTimers = new Map();
 
 function escapeMarkdown(text = "") {
   return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
@@ -238,7 +239,12 @@ bot.start(async (ctx) => {
     await ctx.reply(caption, keyboard);
   }
 
-  setTimeout(async () => {
+  const existingTimer = arbiterInviteTimers.get(ctx.from.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  const timer = setTimeout(async () => {
     const user = getUser(ctx.from.id);
     if (user && !user.arbiter_since && (existingUser?.bets_count ?? 0) === 0) {
       await bot.telegram.sendPhoto(
@@ -267,7 +273,9 @@ bot.start(async (ctx) => {
         },
       ).catch(() => {});
     }
+    arbiterInviteTimers.delete(ctx.from.id);
   }, 30000);
+  arbiterInviteTimers.set(ctx.from.id, timer);
 });
 
 bot.on("inline_query", async (ctx) => {
@@ -356,6 +364,11 @@ async function replaceArbiterPrompt(ctx, text, extra = {}) {
 }
 
 bot.action("become_arbiter", async (ctx) => {
+  const existingTimer = arbiterInviteTimers.get(ctx.from.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    arbiterInviteTimers.delete(ctx.from.id);
+  }
   await ctx.answerCbQuery("Checking arbiter access...");
   const addr = getTonAddress(ctx.from.id);
   if (!addr) {
@@ -399,6 +412,11 @@ bot.action("become_arbiter", async (ctx) => {
 });
 
 bot.action("skip_arbiter", async (ctx) => {
+  const existingTimer = arbiterInviteTimers.get(ctx.from.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    arbiterInviteTimers.delete(ctx.from.id);
+  }
   await ctx.answerCbQuery();
   await ctx.deleteMessage().catch(() => {});
 });
