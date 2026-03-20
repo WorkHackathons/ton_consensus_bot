@@ -177,6 +177,16 @@ export function getBetsByUser(telegramId) {
   `, [telegramId, telegramId]);
 }
 
+export function getLatestUserBet(telegramId) {
+  return get(`
+    SELECT *
+    FROM bets
+    WHERE creator_id = ? OR opponent_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `, [telegramId, telegramId]);
+}
+
 export function getPendingBets() {
   return all(`
     SELECT *
