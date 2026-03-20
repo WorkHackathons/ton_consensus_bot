@@ -192,7 +192,24 @@ bot.start(async (ctx) => {
 });
 
 bot.on("inline_query", async (ctx) => {
-  const bet = getLatestUserBet(ctx.from.id);
+  const query = (ctx.inlineQuery?.query || "").trim();
+  let bet = null;
+
+  if (/^bet_\d+$/i.test(query)) {
+    const betId = Number(query.replace(/^bet_/i, ""));
+    const requestedBet = getBet(betId);
+    if (
+      requestedBet
+      && (Number(requestedBet.creator_id) === Number(ctx.from.id) || Number(requestedBet.opponent_id) === Number(ctx.from.id))
+    ) {
+      bet = requestedBet;
+    }
+  }
+
+  if (!bet) {
+    bet = getLatestUserBet(ctx.from.id);
+  }
+
   if (!bet) {
     await ctx.answerInlineQuery([], { cache_time: 5 });
     return;
