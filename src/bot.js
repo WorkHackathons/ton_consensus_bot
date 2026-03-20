@@ -141,6 +141,7 @@ bot.start(async (ctx) => {
 
   const payload = ctx.startPayload || "";
   let appUrl = buildAppUrl();
+  let isJoinInvite = false;
 
   if (payload === "newbet") {
     appUrl = buildAppUrl("?action=newbet");
@@ -150,6 +151,7 @@ bot.start(async (ctx) => {
     const betId = Number(payload.replace("join_", ""));
     if (Number.isInteger(betId) && betId > 0) {
       appUrl = buildAppUrl(`?action=join&bet=${betId}`);
+      isJoinInvite = true;
     }
   } else if (payload.startsWith("bet_")) {
     const betId = Number(payload.replace("bet_", ""));
@@ -160,6 +162,28 @@ bot.start(async (ctx) => {
 
   if (!appUrl) {
     await ctx.reply("Mini App not configured yet.");
+    return;
+  }
+
+  if (isJoinInvite) {
+    const betId = Number(payload.replace("join_", ""));
+    const bet = getBet(betId);
+    const inviteCaption = bet
+      ? `👊 *Challenge received*\n\n` +
+        `*Bet:* ${bet.description}\n` +
+        `*Stake:* ${bet.amount_ton} TON each\n\n` +
+        `Open the Mini App below to accept this exact challenge and continue inside the app.`
+      : `👊 *Challenge received*\n\n` +
+        `Open the Mini App below to accept this exact challenge and continue inside the app.`;
+
+    await ctx.reply(inviteCaption, {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "⚡ Accept Challenge in App", web_app: { url: appUrl } },
+        ]],
+      },
+    });
     return;
   }
 
