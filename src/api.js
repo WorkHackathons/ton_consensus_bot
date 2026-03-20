@@ -131,6 +131,17 @@ export default function createApiRouter(bot) {
   router.post("/bets", express.json(), (req, res) => {
     const deadlineTs = parseInt(req.body.deadline, 10);
     const now = Math.floor(Date.now() / 1000);
+
+    if (!Number.isFinite(deadlineTs)) {
+      return res.status(400).json({ error: "Deadline is required" });
+    }
+    if (deadlineTs < now + 600) {
+      return res.status(400).json({ error: "Deadline must be at least 10 minutes from now" });
+    }
+    if (deadlineTs > now + 30 * 24 * 3600) {
+      return res.status(400).json({ error: "Deadline cannot be more than 30 days from now" });
+    }
+
     const result = CreateBetSchema.safeParse({
       ...req.body,
       creator_id: Number(req.body.creator_id),
@@ -140,16 +151,6 @@ export default function createApiRouter(bot) {
 
     if (!result.success) {
       return res.status(400).json({ error: result.error.errors[0].message });
-    }
-
-    if (!deadlineTs) {
-      return res.status(400).json({ error: "Deadline is required" });
-    }
-    if (deadlineTs < now + 600) {
-      return res.status(400).json({ error: "Deadline must be at least 10 minutes from now" });
-    }
-    if (deadlineTs > now + 30 * 24 * 3600) {
-      return res.status(400).json({ error: "Deadline cannot be more than 30 days from now" });
     }
 
     upsertUser(result.data.creator_id, result.data.username ?? null);
