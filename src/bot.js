@@ -219,19 +219,18 @@ bot.on("inline_query", async (ctx) => {
 
   await ctx.answerInlineQuery([
     {
-      type: "article",
+      type: "photo",
       id: String(bet.id),
       title: `Bet #${bet.id}: ${bet.description}`,
       description: `${bet.amount_ton} TON each`,
+      photo_url: logoUrl,
       thumbnail_url: logoUrl,
-      input_message_content: {
-        message_text:
-          `*I challenge you to a bet!*\n\n` +
-          `_${bet.description}_\n\n` +
-          `*${bet.amount_ton} TON* each\n\n` +
-          `Accept the challenge below.`,
-        parse_mode: "Markdown",
-      },
+      caption:
+        `*I challenge you to a bet!*\n\n` +
+        `_${bet.description}_\n\n` +
+        `*${bet.amount_ton} TON* each\n\n` +
+        `Accept the challenge below.`,
+      parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [[{
           text: "Accept Bet",
