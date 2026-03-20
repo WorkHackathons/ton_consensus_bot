@@ -232,7 +232,7 @@ export default function createApiRouter(bot) {
     return res.json({ ok: true, bet });
   });
 
-  router.post("/bets/:id/join", express.json(), (req, res) => {
+  router.post("/bets/:id/join", express.json(), async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -267,7 +267,13 @@ export default function createApiRouter(bot) {
 
     upsertUser(result.data.opponent_id, result.data.username ?? null);
     joinBet(betId, result.data.opponent_id);
-    return res.json({ ok: true, bet: getBet(betId) });
+    const joinedBet = getBet(betId);
+    await safeNotify(
+      bot,
+      bet.creator_id,
+      `⚡️ Your challenge was accepted.\n\nUser #${result.data.opponent_id} is now inside the Mini App and waiting for you to complete the deposit step.`,
+    );
+    return res.json({ ok: true, bet: joinedBet });
   });
 
   router.post("/bets/:id/deposit", express.json(), async (req, res) => {
