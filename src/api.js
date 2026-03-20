@@ -9,6 +9,7 @@ import {
   finalizeBet,
   getBet,
   getBetsByUser,
+  getUser,
   getTonAddress,
   getVotes,
   joinBet,
@@ -181,6 +182,19 @@ export default function createApiRouter(bot) {
     } catch (error) {
       return res.status(500).json({ error: error.message || "Failed to load wallet balance" });
     }
+  });
+
+  router.get("/me", (req, res) => {
+    const telegramUser = requireTelegramUser(req, res);
+    if (!telegramUser) return;
+    const user = getUser(Number(telegramUser.id));
+    res.json({
+      telegram_id: Number(telegramUser.id),
+      username: telegramUser.username || user?.username || null,
+      arbiter_since: user?.arbiter_since ?? null,
+      referral_earnings: Number(user?.referral_earnings ?? 0),
+      ton_address: user?.ton_address ?? null,
+    });
   });
 
   router.post("/bets", express.json(), (req, res) => {
