@@ -356,7 +356,7 @@ async function replaceArbiterPrompt(ctx, text, extra = {}) {
 }
 
 bot.action("become_arbiter", async (ctx) => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery("Checking arbiter access...");
   const addr = getTonAddress(ctx.from.id);
   if (!addr) {
     const miniAppUrl = buildAppUrl("?action=mybets");
@@ -377,6 +377,7 @@ bot.action("become_arbiter", async (ctx) => {
   }
 
   becomeArbiter(ctx.from.id);
+  await ctx.answerCbQuery("You are now an arbiter.", { show_alert: true }).catch(() => {});
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await replaceArbiterPrompt(
     ctx,
