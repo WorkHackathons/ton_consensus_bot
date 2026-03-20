@@ -369,6 +369,16 @@ bot.action("become_arbiter", async (ctx) => {
     clearTimeout(existingTimer);
     arbiterInviteTimers.delete(ctx.from.id);
   }
+  const currentUser = getUser(ctx.from.id);
+  if (currentUser?.arbiter_since) {
+    await ctx.answerCbQuery("You are already an arbiter.", { show_alert: true }).catch(() => {});
+    await replaceArbiterPrompt(
+      ctx,
+      "✅ *Arbiter status active*\n\nYou'll be notified when a dispute needs your vote.",
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
   await ctx.answerCbQuery("Checking arbiter access...");
   const addr = getTonAddress(ctx.from.id);
   if (!addr) {
