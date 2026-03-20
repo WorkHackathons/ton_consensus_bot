@@ -339,17 +339,33 @@ bot.command("getvideoid", async (ctx) => {
   await ctx.reply("Reply to a video with /getvideoid");
 });
 
+async function replaceArbiterPrompt(ctx, text, extra = {}) {
+  try {
+    if (ctx.callbackQuery?.message?.photo) {
+      await ctx.editMessageCaption(text, extra);
+      return;
+    }
+    await ctx.editMessageText(text, extra);
+  } catch {
+    await ctx.reply(text, extra);
+  }
+}
+
 bot.action("become_arbiter", async (ctx) => {
   await ctx.answerCbQuery();
   const addr = getTonAddress(ctx.from.id);
   if (!addr) {
-    await ctx.editMessageText("Connect your TON wallet inside the Mini App first to receive arbiter rewards.");
+    await replaceArbiterPrompt(
+      ctx,
+      "Connect your TON wallet inside the Mini App first to receive arbiter rewards.",
+    );
     return;
   }
 
   becomeArbiter(ctx.from.id);
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
-  await ctx.editMessageText(
+  await replaceArbiterPrompt(
+    ctx,
     `✅ *You are now a TON Consensus Arbiter!*\n\n` +
     `We'll notify you when your vote is needed.\n` +
     `Earn TON by helping the platform grow.\n\n` +
