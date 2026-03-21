@@ -101,6 +101,8 @@ export function initDB() {
       payout_txhash TEXT,
       created_at INTEGER NOT NULL,
       deadline INTEGER,
+      hidden_by_creator INTEGER NOT NULL DEFAULT 0,
+      hidden_by_opponent INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (creator_id) REFERENCES users(telegram_id),
       FOREIGN KEY (opponent_id) REFERENCES users(telegram_id)
     );
@@ -135,6 +137,8 @@ export function initDB() {
   ensureColumn("users", "referred_by", "INTEGER DEFAULT NULL");
   ensureColumn("users", "referral_earnings", "REAL NOT NULL DEFAULT 0");
   ensureColumn("bets", "oracle_deadline", "INTEGER DEFAULT NULL");
+  ensureColumn("bets", "hidden_by_creator", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("bets", "hidden_by_opponent", "INTEGER NOT NULL DEFAULT 0");
   saveDB();
 }
 
@@ -280,7 +284,11 @@ export function getBetsByUser(telegramId) {
   return all(`
     SELECT *
     FROM bets
-    WHERE creator_id = ? OR opponent_id = ?
+    WHERE (
+        creator_id = ? AND COALESCE(hidden_by_creator, 0) = 0
+      ) OR (
+        opponent_id = ? AND COALESCE(hidden_by_opponent, 0) = 0
+      )
     ORDER BY created_at DESC
     LIMIT 10
   `, [telegramId, telegramId]);
@@ -294,6 +302,30 @@ export function getLatestUserBet(telegramId) {
     ORDER BY created_at DESC
     LIMIT 1
   `, [telegramId, telegramId]);
+}
+
+export function hideBetForUser(betId, telegramId) {
+  const bet = getBet(betId);
+  if (!bet) {
+    return { ok: false, error: "Bet not found" };
+  }
+
+  const status = String(bet.status || "");
+  if (status !== BET_STATUS.done && status !== BET_STATUS.refunded) {
+    return { ok: false, error: "Only completed or refunded bets can be removed" };
+  }
+
+  if (Number(bet.creator_id) === Number(telegramId)) {
+    write("UPDATE bets SET hidden_by_creator = 1 WHERE id = ?", [betId]);
+    return { ok: true };
+  }
+
+  if (Number(bet.opponent_id) === Number(telegramId)) {
+    write("UPDATE bets SET hidden_by_opponent = 1 WHERE id = ?", [betId]);
+    return { ok: true };
+  }
+
+  return { ok: false, error: "You are not a participant in this bet" };
 }
 
 export function getPendingBets() {
