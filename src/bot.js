@@ -399,30 +399,12 @@ bot.action("become_arbiter", async (ctx) => {
 
   await ctx.answerCbQuery("Checking your arbiter access...");
   const addr = getTonAddress(ctx.from.id);
-  if (!addr) {
-    const miniAppUrl = buildAppUrl("?action=mybets");
-    await replaceArbiterPrompt(
-      ctx,
-      `Connect your TON wallet inside the Mini App first to receive arbiter rewards.\n\nIf your wallet is already connected, reopen the Mini App once so the bot can sync your address, then tap Become Arbiter again.`,
-      miniAppUrl
-        ? {
-            reply_markup: {
-              inline_keyboard: [[
-                { text: "Open Mini App", web_app: { url: miniAppUrl } },
-              ]],
-            },
-          }
-        : undefined,
-    );
-    return;
-  }
-
   becomeArbiter(ctx.from.id);
   await ctx.answerCbQuery("You are now an arbiter.", { show_alert: true }).catch(() => {});
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await replaceArbiterPrompt(
     ctx,
-    `✅ *You are now a TON Consensus Arbiter!*\n\nWe'll notify you when your vote is needed.\nEarn TON by helping the platform grow.\n\n*Invite friends and earn more:*\nGet 2% of platform fee from every bet your referrals make.\n\n🔗 Your referral link:\n\`${refLink}\``,
+    `✅ *You are now a TON Consensus Arbiter!*\n\nWe'll notify you when your vote is needed.\nEarn TON by helping the platform grow.${addr ? "" : "\n\nConnect a TON wallet in the Mini App before your first reward is paid out."}\n\n*Invite friends and earn more:*\nGet 2% of platform fee from every bet your referrals make.\n\n🔗 Your referral link:\n\`${refLink}\``,
     {
       parse_mode: "Markdown",
       reply_markup: {
@@ -455,10 +437,6 @@ bot.action("share_referral", async (ctx) => {
 
 bot.command("arbiter", async (ctx) => {
   const addr = getTonAddress(ctx.from.id);
-  if (!addr) {
-    await ctx.reply("Connect your TON wallet inside the Mini App first.");
-    return;
-  }
 
   const user = getUser(ctx.from.id);
   if (user?.arbiter_since) {
@@ -469,7 +447,7 @@ bot.command("arbiter", async (ctx) => {
   becomeArbiter(ctx.from.id);
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await ctx.reply(
-    `✅ *You are now an arbiter!*\n\nYou'll receive notifications when disputes need resolution.\n\n🔗 Your referral link:\n\`${refLink}\``,
+    `✅ *You are now an arbiter!*\n\nYou'll receive notifications when disputes need resolution.${addr ? "" : "\n\nConnect a TON wallet inside the Mini App before your first reward is paid out."}\n\n🔗 Your referral link:\n\`${refLink}\``,
     { parse_mode: "Markdown" },
   );
 });
@@ -693,10 +671,12 @@ setInterval(async () => {
     try {
       const creatorAddress = getTonAddress(bet.creator_id);
       const opponentAddress = getTonAddress(bet.opponent_id);
+      const hadCreatorDeposit = Boolean(bet.creator_deposit);
+      const hadOpponentDeposit = Boolean(bet.opponent_deposit);
 
-      if (bet.creator_deposit && bet.opponent_id && bet.opponent_deposit && creatorAddress && opponentAddress) {
+      if (hadCreatorDeposit && bet.opponent_id && hadOpponentDeposit && creatorAddress && opponentAddress) {
         await refundBoth(creatorAddress, opponentAddress, bet.amount_ton);
-      } else if (bet.creator_deposit && creatorAddress) {
+      } else if (hadCreatorDeposit && creatorAddress) {
         await refundSingle(creatorAddress, bet.amount_ton);
       }
 
@@ -704,8 +684,19 @@ setInterval(async () => {
       await safeNotify(
         bot,
         bet.creator_id,
-        `⏰ Bet #${bet.id} expired with no opponent.\nYour deposit has been refunded.`,
+        hadCreatorDeposit
+          ? `⏰ Bet #${bet.id} expired with no opponent.\nYour deposit has been refunded.`
+          : `⏰ Bet #${bet.id} expired with no opponent.\nThe market has been closed automatically.`,
       );
+      if (bet.opponent_id) {
+        await safeNotify(
+          bot,
+          bet.opponent_id,
+          hadOpponentDeposit
+            ? `⏰ Bet #${bet.id} expired before activation.\nYour deposit has been refunded.`
+            : `⏰ Bet #${bet.id} expired before activation.`,
+        );
+      }
     } catch (error) {
       console.error(`Expired pending bet handler failed for bet ${bet.id}:`, error.message);
     }
@@ -736,7 +727,7 @@ setInterval(async () => {
       console.error(`Expired bet handler failed for bet ${bet.id}:`, error.message);
     }
   }
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 if (process.env.DISABLE_BOT_LAUNCH !== "1") {
   bot.launch({
