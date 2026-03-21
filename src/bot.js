@@ -1,4 +1,4 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 import express from "express";
 import { Markup, Telegraf } from "telegraf";
 import {
@@ -747,9 +747,34 @@ setInterval(async () => {
   }
 }, 60 * 1000);
 
+async function launchBotWithRetry(attempt = 1) {
+  try {
+    await bot.launch({
+      allowedUpdates: ["message", "callback_query", "inline_query"],
+    });
+    logger.info(`[BOT] Telegram bot launched successfully on attempt ${attempt}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const retryable = /ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|network/i.test(message);
+
+    logger.error(`[BOT] Launch failed on attempt ${attempt}: ${message}`);
+
+    if (!retryable || attempt >= 8) {
+      throw error;
+    }
+
+    const delayMs = Math.min(5000 * attempt, 30000);
+    logger.warn(`[BOT] Retrying Telegram launch in ${Math.round(delayMs / 1000)}s...`);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return launchBotWithRetry(attempt + 1);
+  }
+}
+
 if (process.env.DISABLE_BOT_LAUNCH !== "1") {
-  bot.launch({
-    allowedUpdates: ["message", "callback_query", "inline_query"],
+  launchBotWithRetry().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(`[BOT] Fatal launch failure: ${message}`);
+    process.exit(1);
   });
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
