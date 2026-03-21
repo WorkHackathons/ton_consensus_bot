@@ -59,6 +59,10 @@ function getNetworkGlobalId() {
   return process.env.NETWORK === "mainnet" ? -239 : -3;
 }
 
+function hasConfiguredMcp() {
+  return Boolean(process.env.MCP_URL?.trim());
+}
+
 function getFriendlyAddress(address) {
   return address.toString({
     bounceable: true,
@@ -458,7 +462,11 @@ async function sendTonViaBestMethod({ toAddress, amountTon, comment }) {
         amountTon: Number(Number(amountTon).toFixed(9)),
         memo: comment,
       });
-    } catch {
+    } catch (directError) {
+      if (!hasConfiguredMcp()) {
+        throw directError;
+      }
+
       const result = await callMcp("send_ton", {
         toAddress,
         amount: Number(amountTon).toFixed(9),
@@ -501,6 +509,11 @@ export async function getWalletAddress() {
       return direct.address;
     } catch {
     }
+  }
+
+  if (!hasConfiguredMcp()) {
+    const direct = await getDirectWalletContext();
+    return getDepositDisplayAddress(direct.wallet.address);
   }
 
   try {
@@ -778,7 +791,10 @@ export async function refundBoth(address1, address2, amountTon) {
             memo: "TON Consensus refund",
           }));
           continue;
-        } catch {
+        } catch (directError) {
+          if (!hasConfiguredMcp()) {
+            throw directError;
+          }
         }
       }
 
@@ -818,7 +834,10 @@ export async function refundSingle(address, amountTon) {
           amountTon: Number(Number(amountTon).toFixed(9)),
           memo: "TON Consensus refund",
         });
-      } catch {
+      } catch (directError) {
+        if (!hasConfiguredMcp()) {
+          throw directError;
+        }
       }
     }
 
