@@ -11,6 +11,7 @@ import {
   getBet,
   getBetsByUser,
   getUser,
+  hideBetForUser,
   getTonAddress,
   getVotes,
   joinBet,
@@ -207,6 +208,7 @@ export default function createApiRouter(bot) {
   router.get("/me", (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) return;
+    upsertUser(Number(telegramUser.id), telegramUser.username ?? null);
     const user = getUser(Number(telegramUser.id));
     res.json({
       telegram_id: Number(telegramUser.id),
@@ -415,14 +417,42 @@ export default function createApiRouter(bot) {
       return res.json({ ok: true, stage: "oracle", bet: getBet(betId) });
     }
 
-    const payoutResult = await payoutForBet({
-      bet: updatedBet,
-      winnerId: resolution,
-      bot,
-      tonscanBase: TONSCAN,
-    });
+    try {
+      const payoutResult = await payoutForBet({
+        bet: updatedBet,
+        winnerId: resolution,
+        bot,
+        tonscanBase: TONSCAN,
+      });
 
-    return res.json({ ok: true, stage: "settled", txHash: payoutResult.txHash, bet: getBet(betId) });
+      return res.json({ ok: true, stage: "settled", txHash: payoutResult.txHash, bet: getBet(betId) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Payout failed";
+      await safeNotify(bot, updatedBet.creator_id, `Bet #${betId} was resolved, but payout could not be sent yet.\n${message}`);
+      if (updatedBet.opponent_id) {
+        await safeNotify(bot, updatedBet.opponent_id, `Bet #${betId} was resolved, but payout could not be sent yet.\n${message}`);
+      }
+      return res.status(500).json({ error: message, stage: "payout_failed", bet: getBet(betId) });
+    }
+  });
+
+  router.post("/bets/:id/hide", express.json(), (req, res) => {
+    const telegramUser = requireTelegramUser(req, res);
+    if (!telegramUser) {
+      return;
+    }
+
+    const betId = Number(req.params.id);
+    if (!Number.isInteger(betId) || betId <= 0) {
+      return res.status(400).json({ error: "Invalid bet id" });
+    }
+
+    const result = hideBetForUser(betId, Number(telegramUser.id));
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error || "Failed to remove bet" });
+    }
+
+    return res.json({ ok: true, betId });
   });
 
   router.post("/bets/:id/vote", express.json(), async (req, res) => {
