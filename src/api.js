@@ -1,5 +1,6 @@
 import express from "express";
 import crypto from "node:crypto";
+import { Address } from "@ton/ton";
 import { z } from "zod";
 import {
   activateBet,
@@ -62,9 +63,28 @@ function requireTelegramUser(req, res) {
   return user;
 }
 
+function normalizeTonAddress(address) {
+  try {
+    return Address.parse(String(address).trim()).toString({
+      bounceable: true,
+      testOnly: process.env.NETWORK !== "mainnet",
+    });
+  } catch {
+    return String(address || "").trim();
+  }
+}
+
+
 const AddressSchema = z.object({
   telegram_id: z.number().int().positive(),
-  address: z.string().regex(/^[UEk0]Q[A-Za-z0-9_-]{46,64}$/, "Invalid TON address"),
+  address: z.string().min(10, "Invalid TON address").refine((value) => {
+    try {
+      Address.parse(String(value).trim());
+      return true;
+    } catch {
+      return false;
+    }
+  }, "Invalid TON address"),
 });
 
 const CreateBetSchema = z.object({
@@ -218,6 +238,7 @@ export default function createApiRouter(bot) {
     const result = CreateBetSchema.safeParse({
       ...req.body,
       creator_id: Number(telegramUser.id),
+      username: telegramUser.username,
       amount_ton: Number(req.body.amount_ton),
       deadline: deadlineTs,
     });
@@ -241,6 +262,7 @@ export default function createApiRouter(bot) {
     const result = JoinBetSchema.safeParse({
       ...req.body,
       opponent_id: Number(telegramUser.id),
+      username: telegramUser.username,
     });
 
     if (!result.success) {
@@ -273,7 +295,7 @@ export default function createApiRouter(bot) {
     await safeNotify(
       bot,
       bet.creator_id,
-      `⚡️ Your challenge was accepted.\n\n${opponentLabel} is now inside the Mini App and waiting for you to complete the deposit step.`,
+      `⚡ Your challenge was accepted.\n\n${opponentLabel} is now inside the Mini App and waiting for you to complete the deposit step.`, 
     );
     return res.json({ ok: true, bet: joinedBet });
   });
@@ -316,12 +338,17 @@ export default function createApiRouter(bot) {
     }
 
     const savedAddress = getTonAddress(result.data.telegram_id);
-    if (!savedAddress) {
+    const effectiveAddress = result.data.userWalletAddress || savedAddress;
+    if (!effectiveAddress) {
       return res.status(400).json({ error: "Connect wallet first" });
     }
 
+    if (!savedAddress && result.data.userWalletAddress) {
+      saveTonAddress(result.data.telegram_id, normalizeTonAddress(result.data.userWalletAddress));
+    }
+
     const verifiedTxHash = await verifyDeposit(
-      result.data.userWalletAddress,
+      effectiveAddress,
       Number(bet.amount_ton),
       Number(bet.created_at),
     );
@@ -433,7 +460,7 @@ export default function createApiRouter(bot) {
     }
 
     upsertUser(result.data.telegram_id, null);
-    saveTonAddress(result.data.telegram_id, result.data.address);
+    saveTonAddress(result.data.telegram_id, normalizeTonAddress(result.data.address));
     return res.json({ ok: true });
   });
 
