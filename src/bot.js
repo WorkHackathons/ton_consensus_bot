@@ -47,8 +47,19 @@ function buildAppUrl(path = "") {
   if (!base) {
     return null;
   }
-
-  return path ? `${base}${path}` : base;
+  if (!path) {
+    return base;
+  }
+  try {
+    const url = new URL(base);
+    const next = new URL(path, `${url.origin}/`);
+    next.searchParams.forEach((value, key) => {
+      url.searchParams.set(key, value);
+    });
+    return `${url.origin}${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return `${base}${path}`;
+  }
 }
 
 initDB();
@@ -225,8 +236,8 @@ bot.start(async (ctx) => {
       inline_keyboard: [
         [{ text: "📱 Open App", web_app: { url: appUrl } }],
         [
-          { text: "⚡️ Create Bet", web_app: { url: `${appUrl}?action=newbet` } },
-          { text: "📋 My Bets", web_app: { url: `${appUrl}?action=mybets` } },
+          { text: "⚡ Create Bet", web_app: { url: buildAppUrl("?action=newbet") } },
+          { text: "📋 My Bets", web_app: { url: buildAppUrl("?action=mybets") } },
         ],
       ],
     },
@@ -237,6 +248,11 @@ bot.start(async (ctx) => {
     await ctx.replyWithVideo(process.env.VIDEO_FILE_ID, { caption, ...keyboard });
   } else {
     await ctx.reply(caption, keyboard);
+  }
+
+  const currentStateUser = getUser(ctx.from.id);
+  if (currentStateUser?.arbiter_since) {
+    return;
   }
 
   const existingTimer = arbiterInviteTimers.get(ctx.from.id);
@@ -262,7 +278,7 @@ bot.start(async (ctx) => {
             `10 TON pot → you earn ~0.17 TON\n` +
             `100 TON pot → you earn ~1.7 TON\n` +
             `1,000 TON pot → you earn ~17 TON\n\n` +
-            `The more disputes on the platform — the more you earn.`,
+            `The more disputes on the platform, the more you earn.`,
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [[
@@ -369,23 +385,25 @@ bot.action("become_arbiter", async (ctx) => {
     clearTimeout(existingTimer);
     arbiterInviteTimers.delete(ctx.from.id);
   }
+
   const currentUser = getUser(ctx.from.id);
   if (currentUser?.arbiter_since) {
     await ctx.answerCbQuery("You are already an arbiter.", { show_alert: true }).catch(() => {});
     await replaceArbiterPrompt(
       ctx,
-      "✅ *Arbiter status active*\n\nYou'll be notified when a dispute needs your vote.",
+      `✅ *Arbiter status active*\n\nYou'll be notified when a dispute needs your vote.`,
       { parse_mode: "Markdown" },
     );
     return;
   }
-  await ctx.answerCbQuery("Checking arbiter access...");
+
+  await ctx.answerCbQuery("Checking your arbiter access...");
   const addr = getTonAddress(ctx.from.id);
   if (!addr) {
     const miniAppUrl = buildAppUrl("?action=mybets");
     await replaceArbiterPrompt(
       ctx,
-      "Connect your TON wallet inside the Mini App first to receive arbiter rewards.\n\nIf your wallet is already connected, reopen the Mini App once so the bot can sync your address, then tap Become Arbiter again.",
+      `Connect your TON wallet inside the Mini App first to receive arbiter rewards.\n\nIf your wallet is already connected, reopen the Mini App once so the bot can sync your address, then tap Become Arbiter again.`,
       miniAppUrl
         ? {
             reply_markup: {
@@ -404,12 +422,7 @@ bot.action("become_arbiter", async (ctx) => {
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await replaceArbiterPrompt(
     ctx,
-    `✅ *You are now a TON Consensus Arbiter!*\n\n` +
-    `We'll notify you when your vote is needed.\n` +
-    `Earn TON by helping the platform grow.\n\n` +
-    `*Invite friends and earn more:*\n` +
-    `Get 2% of platform fee from every bet your referrals make.\n\n` +
-    `🔗 Your referral link:\n\`${refLink}\``,
+    `✅ *You are now a TON Consensus Arbiter!*\n\nWe'll notify you when your vote is needed.\nEarn TON by helping the platform grow.\n\n*Invite friends and earn more:*\nGet 2% of platform fee from every bet your referrals make.\n\n🔗 Your referral link:\n\`${refLink}\``,
     {
       parse_mode: "Markdown",
       reply_markup: {
@@ -435,13 +448,7 @@ bot.action("share_referral", async (ctx) => {
   await ctx.answerCbQuery();
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await ctx.reply(
-    `🔗 *Your Referral Link:*\n\n` +
-    `\`${refLink}\`\n\n` +
-    `*What you earn:*\n` +
-    `• 2% of platform fee from every bet your referrals make\n` +
-    `• Paid automatically in TON\n` +
-    `• Unlimited referrals\n\n` +
-    `Share in your chats and earn passively!`,
+    `🔗 *Your Referral Link:*\n\n\`${refLink}\`\n\n*What you earn:*\n• 2% of platform fee from every bet your referrals make\n• Paid automatically in TON\n• Unlimited referrals\n\nShare in your chats and earn passively!`,
     { parse_mode: "Markdown" },
   );
 });
@@ -462,9 +469,7 @@ bot.command("arbiter", async (ctx) => {
   becomeArbiter(ctx.from.id);
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await ctx.reply(
-    `✅ *You are now an arbiter!*\n\n` +
-    `You'll receive notifications when disputes need resolution.\n\n` +
-    `🔗 Your referral link:\n\`${refLink}\``,
+    `✅ *You are now an arbiter!*\n\nYou'll receive notifications when disputes need resolution.\n\n🔗 Your referral link:\n\`${refLink}\``,
     { parse_mode: "Markdown" },
   );
 });
@@ -473,9 +478,7 @@ bot.command("mystats", async (ctx) => {
   const user = getUser(ctx.from.id);
   const accuracy = getArbiterAccuracy(ctx.from.id);
   const isArbiter = !!user?.arbiter_since;
-  const referrals = Number(db.prepare(
-    "SELECT COUNT(*) as count FROM users WHERE referred_by = ?",
-  ).get(ctx.from.id)?.count ?? 0);
+  const referrals = Number(db.prepare("SELECT COUNT(*) as count FROM users WHERE referred_by = ?").get(ctx.from.id)?.count ?? 0);
 
   await ctx.reply(
     `📊 *Your Stats*\n\n` +
@@ -745,3 +748,4 @@ if (process.env.DISABLE_BOT_LAUNCH !== "1") {
 }
 
 export default bot;
+
