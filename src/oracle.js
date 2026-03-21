@@ -74,7 +74,7 @@ async function finalizeWithOracle(bet, winnerId, bot) {
   await safeNotify(
     bot,
     winnerId,
-    `⚖️ 2 of 3 anonymous arbiters voted for ${winnerLabel}.\n\nYou won bet #${bet.id}.\nTx: \`${payoutResult.winnerTxHash}\``,
+    `⚖️ 2 of 3 anonymous arbiters voted for ${winnerLabel}.\n\nYou won bet #${bet.id}.\nTx: \`${payoutResult.winnerTxHash}\``, 
   );
   await safeNotify(bot, loserId, `⚖️ 2 of 3 anonymous arbiters voted for ${winnerLabel}.\nPayout has been sent automatically.`);
 
@@ -85,7 +85,7 @@ async function finalizeWithOracle(bet, winnerId, bot) {
     await safeNotify(
       bot,
       vote.arbiter_id,
-      `✅ Thank you for arbitrating!\nYour reward: ${rewardAmount} TON has been sent to your wallet.\nTX: \`${txHash}\``,
+      `✅ Thank you for arbitrating!\nYour reward: ${rewardAmount} TON has been sent to your wallet.\nTX: \`${txHash}\``, 
     );
   }
 }
@@ -144,7 +144,7 @@ async function notifyArbitersForBet(bet, bot) {
     await safeNotify(
       bot,
       arbiter.telegram_id,
-      `⚖️ Your vote is needed!\n\nBet: ${escapeMarkdown(bet.description)}\nPot: ${bet.amount_ton * 2} TON\n\nPlayer A claims they won.\nPlayer B claims they won.\n\n⭐️ You are one of the first arbiters of TON Consensus!\nVote honestly and earn your share of the commission.\n\nYour reward for voting: ${rewardAmount} TON (paid automatically)\n\n${escapeMarkdown(insight.summary)}`,
+      `⚖️ Your vote is needed!\n\nBet: ${escapeMarkdown(bet.description)}\nPot: ${bet.amount_ton * 2} TON\n\nPlayer A claims they won.\nPlayer B claims they won.\n\n⭐️ You are one of the first arbiters of TON Consensus!\nVote honestly and earn your share of the commission.\n\nYour reward for voting: ${rewardAmount} TON (paid automatically)\n\n${escapeMarkdown(insight.summary)}`, 
     );
 
     try {
