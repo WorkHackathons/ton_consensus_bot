@@ -23,6 +23,7 @@ import {
 const MCP_URL = process.env.MCP_URL || "http://localhost:3000";
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 const PLATFORM_WALLET = process.env.PLATFORM_FEE_WALLET;
+const TON_WALLET_MODE = (process.env.TON_WALLET_MODE || "direct").toLowerCase();
 const TONCENTER_API_BASE = process.env.NETWORK === "mainnet"
   ? "https://toncenter.com/api/v2"
   : "https://testnet.toncenter.com/api/v2";
@@ -50,9 +51,24 @@ function getToncenterApiKey() {
   return process.env.TONCENTER_API_KEY || undefined;
 }
 
+function preferDirectWallet() {
+  return TON_WALLET_MODE !== "mcp";
+}
+
+function getNetworkGlobalId() {
+  return process.env.NETWORK === "mainnet" ? -239 : -3;
+}
+
 function getFriendlyAddress(address) {
   return address.toString({
     bounceable: true,
+    testOnly: process.env.NETWORK !== "mainnet",
+  });
+}
+
+function getDepositDisplayAddress(address) {
+  return address.toString({
+    bounceable: false,
     testOnly: process.env.NETWORK !== "mainnet",
   });
 }
@@ -259,7 +275,18 @@ async function buildDirectWalletContext() {
   if (!requestedVersion || requestedVersion === "v5r1") {
     candidates.push({
       version: "v5r1",
-      wallet: WalletContractV5R1.create({ workchain: 0, publicKey: keyPair.publicKey }),
+      wallet: WalletContractV5R1.create({
+        workchain: 0,
+        publicKey: keyPair.publicKey,
+        walletId: {
+          networkGlobalId: getNetworkGlobalId(),
+          context: {
+            workchain: 0,
+            walletVersion: "v5r1",
+            subwalletNumber: 0,
+          },
+        },
+      }),
     });
   }
 
@@ -424,6 +451,28 @@ export function extractTxHash(result) {
 }
 
 async function sendTonViaBestMethod({ toAddress, amountTon, comment }) {
+  if (preferDirectWallet()) {
+    try {
+      return await sendDirectTon({
+        to: toAddress,
+        amountTon: Number(Number(amountTon).toFixed(9)),
+        memo: comment,
+      });
+    } catch {
+      const result = await callMcp("send_ton", {
+        toAddress,
+        amount: Number(amountTon).toFixed(9),
+        comment,
+      });
+
+      if (!isSuccessfulToolResult(result)) {
+        throw new Error(typeof result === "string" ? result : result?.error || "MCP transfer failed");
+      }
+
+      return extractTxHash(result);
+    }
+  }
+
   try {
     const result = await callMcp("send_ton", {
       toAddress,
@@ -446,6 +495,14 @@ async function sendTonViaBestMethod({ toAddress, amountTon, comment }) {
 }
 
 export async function getWalletAddress() {
+  if (preferDirectWallet()) {
+    try {
+      const direct = await getDirectWalletContext();
+      return direct.address;
+    } catch {
+    }
+  }
+
   try {
     const result = await callMcp("get_wallet", {});
 
@@ -454,16 +511,17 @@ export async function getWalletAddress() {
     }
 
     if (typeof result.address === "string" && result.address) {
-      if (process.env.NETWORK === "testnet" && result.address.startsWith("UQ")) {
-        return "0QAZli6nZl1hyfdJbZSdC0cszqU5mFsZbaeQPsS0dNpXsWPL";
+      try {
+        return getDepositDisplayAddress(Address.parse(result.address));
+      } catch {
+        return result.address;
       }
-      return result.address;
     }
 
     throw new Error("MCP wallet address not found");
   } catch (error) {
     const direct = await getDirectWalletContext();
-    return direct.address;
+    return getDepositDisplayAddress(direct.wallet.address);
   }
 }
 
@@ -712,6 +770,18 @@ export async function refundBoth(address1, address2, amountTon) {
     const results = [];
 
     for (const address of [address1, address2]) {
+      if (preferDirectWallet()) {
+        try {
+          results.push(await sendDirectTon({
+            to: address,
+            amountTon: Number(Number(amountTon).toFixed(9)),
+            memo: "TON Consensus refund",
+          }));
+          continue;
+        } catch {
+        }
+      }
+
       try {
         const result = await callMcp("send_ton", {
           toAddress: address,
@@ -741,6 +811,17 @@ export async function refundBoth(address1, address2, amountTon) {
 
 export async function refundSingle(address, amountTon) {
   try {
+    if (preferDirectWallet()) {
+      try {
+        return await sendDirectTon({
+          to: address,
+          amountTon: Number(Number(amountTon).toFixed(9)),
+          memo: "TON Consensus refund",
+        });
+      } catch {
+      }
+    }
+
     try {
       const result = await callMcp("send_ton", {
         toAddress: address,
