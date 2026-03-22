@@ -1,4 +1,4 @@
-﻿import { Markup } from "telegraf";
+import { Markup } from "telegraf";
 import {
   assignArbiters,
   finalizeBet,
@@ -217,10 +217,26 @@ async function notifyArbitersForBet(bet, bot) {
 export async function startOracleForBet(bet, bot) {
   logger.info(`Starting startOracleForBet for bet_id: ${bet.id}`);
   try {
-    const autoResolved = await runArbiterEngine(bet, bot);
-    if (autoResolved) {
+    const aiResult = await runArbiterEngine(bet, bot);
+    if (aiResult?.status === "resolved") {
       logger.info(`startOracleForBet completed successfully: auto_resolved for bet_id ${bet.id}`);
       return -1;
+    }
+    if (aiResult?.status === "payout_failed") {
+      await safeNotify(
+        bot,
+        bet.creator_id,
+        `🤖 AI found the winner for bet #${bet.id}, but payout could not be sent yet.\n${escapeMarkdown(aiResult.error || "Unknown payout error")}`,
+      );
+      if (bet.opponent_id) {
+        await safeNotify(
+          bot,
+          bet.opponent_id,
+          `🤖 AI found the winner for bet #${bet.id}, but payout could not be sent yet.\n${escapeMarkdown(aiResult.error || "Unknown payout error")}`,
+        );
+      }
+      logger.warn(`startOracleForBet stopped before arbiter fallback due to payout failure for bet_id ${bet.id}`);
+      return -2;
     }
 
     startOracle(bet.id);
