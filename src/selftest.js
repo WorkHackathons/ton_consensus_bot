@@ -16,6 +16,7 @@ import db, {
   tallyVotes,
   upsertUser,
 } from "./db.js";
+import { runArbiterEngineDryRun } from "./engine.js";
 import { getAddressBalance, getWalletAddress } from "./ton.js";
 import { logger } from "./logger.js";
 import { notifyDevInfo } from "./devNotify.js";
@@ -153,6 +154,52 @@ async function simulateDisputeFlow() {
   }
 }
 
+async function simulateAiAutoArbiter() {
+  const stamp = Date.now();
+  const creatorId = 920000001 + (stamp % 1000);
+  const opponentId = 920001001 + (stamp % 1000);
+  const userIds = [creatorId, opponentId];
+
+  logger.info(`[SELFTEST] Starting AI Auto Arbiter dry-run for users ${creatorId}/${opponentId}`);
+
+  try {
+    const depositWallet = await getWalletAddress();
+
+    for (const id of userIds) {
+      upsertUser(id, `selftest_ai_${id}`);
+      saveTonAddress(id, depositWallet);
+    }
+
+    const verdict = await runArbiterEngineDryRun({
+      id: `selftest_ai_${stamp}`,
+      creator_id: creatorId,
+      opponent_id: opponentId,
+      description: "Bitcoin is a cryptocurrency.",
+      amount_ton: 0.1,
+      deadline: Math.floor(Date.now() / 1000) - 3600,
+    });
+
+    if (!verdict) {
+      throw new Error("AI agent did not return a high-confidence verdict");
+    }
+
+    if (verdict.winner_side !== "creator") {
+      throw new Error(`AI agent returned unexpected winner_side=${verdict.winner_side}`);
+    }
+
+    if (Number(verdict.confidence) < 0.85) {
+      throw new Error(`AI agent confidence too low (${verdict.confidence})`);
+    }
+
+    return {
+      details: `winner_side=${verdict.winner_side}, confidence=${Math.round(Number(verdict.confidence) * 100)}%, sources=${verdict.sources?.length || 0}`,
+      fix: "Check OPENAI_API_KEY, TAVILY_API_KEY, outbound internet, and model/tool availability if AI oracle dry-run fails.",
+    };
+  } finally {
+    cleanupSelfTestRecords({ betIds: [], userIds });
+  }
+}
+
 function buildReport(results) {
   const failed = results.filter((item) => !item.ok);
   const passed = results.filter((item) => item.ok);
@@ -216,6 +263,7 @@ export async function runSelfTest(bot) {
       }
       return { details: "OPENAI_API_KEY and TAVILY_API_KEY present" };
     }),
+    runCheck("AI Auto Arbiter dry run", simulateAiAutoArbiter),
     runCheck("Mini App config", async () => {
       if (!process.env.MINIAPP_URL) {
         throw new Error("MINIAPP_URL missing");
