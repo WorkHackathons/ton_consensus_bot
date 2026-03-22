@@ -9,7 +9,7 @@
 [![AI Oracle](https://img.shields.io/badge/AI-Oracle-111111?style=for-the-badge)](https://openai.com/)
 [![Status](https://img.shields.io/badge/Status-Hackathon%20MVP-0A7B34?style=for-the-badge)](https://github.com/WorkHackathons/ton_consensus_bot)
 
-[Bot](https://t.me/ton_consensus_bot) | [Channel](https://t.me/consensuston) | [Landing](https://ton-consensus.vercel.app/) | [Landing Mirror](https://tonconsensus.netlify.app/) | [GitHub](https://github.com/WorkHackathons/ton_consensus_bot)
+[Bot](https://t.me/ton_consensus_bot) | [Channel](https://t.me/consensuston) | [Landing](https://tonconsensus.netlify.app/) | [Open App](https://t.me/ton_consensus_bot) | [GitHub](https://github.com/WorkHackathons/ton_consensus_bot)
 
 </div>
 
@@ -301,8 +301,8 @@ Core variables:
 | --- | --- |
 | Bot | https://t.me/ton_consensus_bot |
 | Channel | https://t.me/consensuston |
-| Landing | https://ton-consensus.vercel.app/ |
-| Landing Mirror | https://tonconsensus.netlify.app/ |
+| Landing | https://tonconsensus.netlify.app/ |
+| Open App | https://t.me/ton_consensus_bot |
 | GitHub | https://github.com/WorkHackathons/ton_consensus_bot |
 
 ## Team
