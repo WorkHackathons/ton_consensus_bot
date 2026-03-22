@@ -736,8 +736,9 @@ export async function executePayout(betId, winnerAddress, potTon) {
     });
     logger.info(`[PAYOUT] Winner TX: ${winnerTx}`);
   } catch (error) {
-    logger.error(`[PAYOUT] Winner transfer FAILED: ${error.message}`);
-    return null;
+    const message = humanizeTonError(error);
+    logger.error(`[PAYOUT] Winner transfer FAILED: ${message}`);
+    throw new Error(message);
   }
 
   let feeTx = null;
