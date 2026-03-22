@@ -166,11 +166,11 @@ If you cannot find enough evidence, respond with:
 
   let verdict = null;
   let iterations = 0;
-  const MAX_ITERATIONS = 6;
+  const maxIterations = 6;
 
-  while (iterations < MAX_ITERATIONS) {
+  while (iterations < maxIterations) {
     iterations += 1;
-    logger.info(`[ENGINE] Iteration ${iterations}/${MAX_ITERATIONS}`);
+    logger.info(`[ENGINE] Iteration ${iterations}/${maxIterations}`);
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -256,7 +256,7 @@ export async function runArbiterEngine(bet, bot) {
   logger.info(`Starting runArbiterEngine for bet_id: ${bet.id}`);
   const verdict = await resolveBetWithAgent(bet);
   if (!verdict) {
-    return false;
+    return { status: "low_confidence" };
   }
 
   const winnerId = verdict.winner_side === "creator" ? bet.creator_id : bet.opponent_id;
@@ -269,17 +269,19 @@ export async function runArbiterEngine(bet, bot) {
   if (winnerAddress) {
     try {
       const payoutResult = await executePayout(bet.id, winnerAddress, Number(bet.amount_ton) * 2);
-      if (!payoutResult) {
-        logger.error("[ENGINE] Payout failed");
-        await notifyDev(`💸 AI PAYOUT FAILED\nBet: ${bet.id}\nWinner: ${winnerAddress}\nAmount: ${Number(bet.amount_ton) * 2}\nError: executePayout returned null`);
-        return false;
-      }
       txHash = payoutResult.txHash;
       logger.info(`[ENGINE] Payout success: ${txHash}`);
     } catch (error) {
-      logger.error(`[ENGINE] Payout error: ${error.message}`);
-      await notifyDev(`💸 AI PAYOUT FAILED\nBet: ${bet.id}\nWinner: ${winnerAddress}\nAmount: ${Number(bet.amount_ton) * 2}\nError: ${error.message}`);
-      return false;
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[ENGINE] Payout error: ${message}`);
+      await notifyDev(`💸 AI PAYOUT FAILED\nBet: ${bet.id}\nWinner: ${winnerAddress}\nAmount: ${Number(bet.amount_ton) * 2}\nError: ${message}`);
+      return {
+        status: "payout_failed",
+        winnerId,
+        winnerAddress,
+        verdict,
+        error: message,
+      };
     }
   } else {
     txHash = "pending_address";
@@ -298,32 +300,37 @@ export async function runArbiterEngine(bet, bot) {
   try {
     await bot.telegram.sendMessage(
       winnerId,
-      `🤖 *AI Agent resolved this dispute*\n\n` +
-        `📋 _${escapeMarkdown(bet.description)}_\n\n` +
-        `🔍 Found: ${escapeMarkdown(verdict.result || "")}\n` +
-        `💡 ${escapeMarkdown(verdict.reasoning || "")}\n` +
-        `🎯 Confidence: ${Math.round(Number(verdict.confidence) * 100)}%\n` +
-        `${sourcesText ? `📚 Sources: ${escapeMarkdown(sourcesText)}\n` : ""}\n` +
-        `🏆 You won! *${payoutAmount} TON*\n` +
-        `${txHash && txHash !== "pending_address" ? `🔗 [Transaction](${tonscan}/tx/${txHash})` : "Connect your wallet in the Mini App to receive payout."}`,
+      `🤖 *AI Agent resolved this dispute*\n\n`
+        + `📋 _${escapeMarkdown(bet.description)}_\n\n`
+        + `🔍 Found: ${escapeMarkdown(verdict.result || "")}\n`
+        + `💡 ${escapeMarkdown(verdict.reasoning || "")}\n`
+        + `🎯 Confidence: ${Math.round(Number(verdict.confidence) * 100)}%\n`
+        + `${sourcesText ? `📚 Sources: ${escapeMarkdown(sourcesText)}\n` : ""}\n`
+        + `🏆 You won! *${payoutAmount} TON*\n`
+        + `${txHash && txHash !== "pending_address" ? `🔗 [Transaction](${tonscan}/tx/${txHash})` : "Connect your wallet in the Mini App to receive payout."}`,
       { parse_mode: "Markdown" },
     );
 
     await bot.telegram.sendMessage(
       loserId,
-      `🤖 *AI Agent resolved this dispute*\n\n` +
-        `📋 _${escapeMarkdown(bet.description)}_\n\n` +
-        `📊 ${escapeMarkdown(verdict.result || "")}\n` +
-        `💡 ${escapeMarkdown(verdict.reasoning || "")}\n\n` +
-        `❌ You lost this one.`,
+      `🤖 *AI Agent resolved this dispute*\n\n`
+        + `📋 _${escapeMarkdown(bet.description)}_\n\n`
+        + `📊 ${escapeMarkdown(verdict.result || "")}\n`
+        + `💡 ${escapeMarkdown(verdict.reasoning || "")}\n\n`
+        + `❌ You lost this one.`,
       { parse_mode: "Markdown" },
     );
   } catch (error) {
-    logger.error(`[ENGINE] Notification failed: ${error.message}`);
-    await notifyDev(`🤖 ENGINE NOTIFY FAILED\nBet: ${bet.id}\nError: ${error.message}`);
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(`[ENGINE] Notification failed: ${message}`);
+    await notifyDev(`🤖 ENGINE NOTIFY FAILED\nBet: ${bet.id}\nError: ${message}`);
   }
 
   logger.info(`runArbiterEngine completed successfully: ${txHash}`);
-  return true;
+  return {
+    status: "resolved",
+    winnerId,
+    txHash,
+    verdict,
+  };
 }
-
