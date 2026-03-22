@@ -120,11 +120,10 @@ async function executeTool(name, args) {
   return "Tool not available";
 }
 
-export async function runArbiterEngine(bet, bot) {
-  logger.info(`Starting runArbiterEngine for bet_id: ${bet.id}`);
+async function resolveBetWithAgent(bet) {
   if (!process.env.OPENAI_API_KEY) {
     logger.warn("[ENGINE] OPENAI_API_KEY not set, skipping");
-    return false;
+    return null;
   }
 
   if (!openai) {
@@ -236,6 +235,27 @@ If you cannot find enough evidence, respond with:
     || (Number(verdict.confidence) >= 0.9 && (verdict.sources?.length || 0) < 2)
   ) {
     logger.warn("[ENGINE] Low confidence or unknown result, routing to human oracle");
+    return null;
+  }
+
+  return verdict;
+}
+
+export async function runArbiterEngineDryRun(bet) {
+  logger.info(`Starting runArbiterEngineDryRun for bet_id: ${bet.id}`);
+  const verdict = await resolveBetWithAgent(bet);
+  if (!verdict) {
+    logger.warn(`runArbiterEngineDryRun failed for bet_id: ${bet.id}, reason: low confidence or no verdict`);
+    return null;
+  }
+  logger.info(`runArbiterEngineDryRun completed successfully: ${JSON.stringify(verdict)}`);
+  return verdict;
+}
+
+export async function runArbiterEngine(bet, bot) {
+  logger.info(`Starting runArbiterEngine for bet_id: ${bet.id}`);
+  const verdict = await resolveBetWithAgent(bet);
+  if (!verdict) {
     return false;
   }
 
@@ -306,3 +326,4 @@ If you cannot find enough evidence, respond with:
   logger.info(`runArbiterEngine completed successfully: ${txHash}`);
   return true;
 }
+
