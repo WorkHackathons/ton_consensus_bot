@@ -428,6 +428,11 @@ export default function createApiRouter(bot) {
       return res.status(404).json({ error: "Bet not found" });
     }
 
+    const now = Math.floor(Date.now() / 1000);
+    if (bet.deadline && Number(bet.deadline) > now) {
+      return res.status(400).json({ error: "Outcome submission opens only after the deadline." });
+    }
+
     if (bet.status !== BET_STATUS.active && bet.status !== BET_STATUS.confirming) {
       return res.status(400).json({ error: "This bet can no longer accept outcomes" });
     }
