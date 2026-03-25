@@ -811,9 +811,13 @@ async function launchBotWithRetry(attempt = 1) {
     await notifyDevInfo("✅ TON Consensus bot started successfully");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const retryable = /ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|network/i.test(message);
+    const code = error?.code || error?.errno || error?.cause?.code || error?.cause?.errno || "";
+    const type = error?.type || error?.cause?.type || "";
+    const name = error?.name || error?.cause?.name || "";
+    const detail = [message, code, type, name].filter(Boolean).join(" | ") || "Unknown launch error";
+    const retryable = /ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|network|fetcherror|system/i.test(detail);
 
-    logger.error(`[BOT] Launch failed on attempt ${attempt}: ${message}`);
+    logger.error(`[BOT] Launch failed on attempt ${attempt}: ${detail}`);
 
     if (!retryable || attempt >= 8) {
       throw error;
@@ -824,6 +828,32 @@ async function launchBotWithRetry(attempt = 1) {
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     return launchBotWithRetry(attempt + 1);
   }
+}
+
+function scheduleBotLaunchRetry(delayMs = 60000, reason = "transient Telegram launch error") {
+  logger.warn(`[BOT] Scheduling new launch cycle in ${Math.round(delayMs / 1000)}s (${reason})`);
+  setTimeout(() => {
+    launchBotWithRetry().catch(handleFatalLaunchFailure);
+  }, delayMs);
+}
+
+function handleFatalLaunchFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error?.code || error?.errno || error?.cause?.code || error?.cause?.errno || "";
+  const type = error?.type || error?.cause?.type || "";
+  const name = error?.name || error?.cause?.name || "";
+  const detail = [message, code, type, name].filter(Boolean).join(" | ") || "Unknown launch error";
+  const retryable = /ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|network|fetcherror|system/i.test(detail);
+
+  logger.error(`[BOT] Fatal launch failure: ${detail}`);
+
+  if (retryable) {
+    notifyDev(`🤖 BOT LAUNCH RETRY LOOP\n${detail}`).catch(() => {});
+    scheduleBotLaunchRetry(60000, detail);
+    return;
+  }
+
+  process.exit(1);
 }
 
 bot.catch(async (error, ctx) => {
@@ -846,11 +876,7 @@ bot.command("selftest", async (ctx) => {
 });
 
 if (process.env.DISABLE_BOT_LAUNCH !== "1") {
-  launchBotWithRetry().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error(`[BOT] Fatal launch failure: ${message}`);
-    process.exit(1);
-  });
+  launchBotWithRetry().catch(handleFatalLaunchFailure);
 
   process.once("SIGINT", async () => {
     await notifyDevInfo("⛔ TON Consensus bot received SIGINT and is shutting down");
