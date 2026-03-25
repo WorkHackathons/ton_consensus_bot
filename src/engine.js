@@ -165,12 +165,6 @@ async function tryResolveCryptoPriceDispute(bet) {
     return null;
   }
 
-  const nowUnix = Math.floor(Date.now() / 1000);
-  if (bet.deadline && nowUnix < Number(bet.deadline)) {
-    logger.info(`[ENGINE] Crypto price fast-path skipped for bet #${bet.id}: deadline not reached yet`);
-    return null;
-  }
-
   const rawPrice = await executeTool("get_crypto_price", { symbol: parsed.symbol });
   let payload = null;
   try {
@@ -196,7 +190,7 @@ async function tryResolveCryptoPriceDispute(bet) {
     winner_side: winnerSide,
     confidence: 0.99,
     result: `${parsed.symbol} traded at $${price.toFixed(2)} and the threshold was ${comparatorText} $${parsed.threshold.toLocaleString()}.`,
-    reasoning: `This dispute matches a direct crypto price condition and was resolved from a live CoinGecko price lookup after the deadline.`,
+    reasoning: `This dispute matches a direct crypto price condition and was resolved from a live CoinGecko price lookup.`,
     sources: ["CoinGecko API"],
   };
 }
