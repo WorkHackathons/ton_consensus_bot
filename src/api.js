@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import crypto from "node:crypto";
 import { Address } from "@ton/ton";
 import { z } from "zod";
@@ -363,26 +363,41 @@ export default function createApiRouter(bot) {
       return res.status(403).json({ error: "You are not a participant in this bet" });
     }
 
-    const savedAddress = getTonAddress(result.data.telegram_id);
-    const effectiveAddress = result.data.userWalletAddress || savedAddress;
-    if (!effectiveAddress) {
+    const savedAddress = normalizeTonAddress(getTonAddress(result.data.telegram_id));
+    const requestedAddress = normalizeTonAddress(result.data.userWalletAddress);
+    const candidateAddresses = Array.from(new Set([requestedAddress, savedAddress].filter(Boolean)));
+
+    if (candidateAddresses.length === 0) {
       return res.status(400).json({ error: "Connect wallet first" });
     }
 
-    if (!savedAddress && result.data.userWalletAddress) {
-      saveTonAddress(result.data.telegram_id, normalizeTonAddress(result.data.userWalletAddress));
+    if (!savedAddress && requestedAddress) {
+      saveTonAddress(result.data.telegram_id, requestedAddress);
     }
 
-    const verifiedTxHash = await verifyDeposit(
-      effectiveAddress,
-      Number(bet.amount_ton),
-      Number(bet.created_at),
-    );
+    let verifiedTxHash = null;
+    let matchedAddress = null;
+
+    for (const candidateAddress of candidateAddresses) {
+      verifiedTxHash = await verifyDeposit(
+        candidateAddress,
+        Number(bet.amount_ton),
+        Number(bet.created_at),
+      );
+      if (verifiedTxHash) {
+        matchedAddress = candidateAddress;
+        break;
+      }
+    }
 
     if (!verifiedTxHash) {
       return res.status(400).json({
         error: "Transaction not found. Please wait 30-60 seconds after sending and try again.",
       });
+    }
+
+    if (matchedAddress && matchedAddress !== savedAddress) {
+      saveTonAddress(result.data.telegram_id, matchedAddress);
     }
 
     confirmDeposit(betId, role);
