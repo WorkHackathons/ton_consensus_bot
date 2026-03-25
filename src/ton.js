@@ -33,6 +33,39 @@ let mcpSessionId = null;
 let mcpInitPromise = null;
 let directWalletPromise = null;
 
+function isTonRpcRateLimit(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /429|too many requests|rate limit|etimedout|timeout|econnreset|socket hang up|fetch failed/i.test(message);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTonRpcRetry(label, operation, options = {}) {
+  const attempts = Number(options.attempts || 4);
+  const baseDelayMs = Number(options.baseDelayMs || 1500);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+
+      if (!isTonRpcRateLimit(error) || attempt === attempts) {
+        throw error;
+      }
+
+      const waitMs = baseDelayMs * attempt;
+      logger.warn(`[TON RPC] ${label} rate-limited on attempt ${attempt}/${attempts}; retrying in ${waitMs}ms`);
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastError;
+}
+
 function humanizeTonError(error) {
   const message = error instanceof Error ? error.message : String(error);
 
@@ -40,7 +73,7 @@ function humanizeTonError(error) {
     return "Платформенный кошелек еще не активирован в сети или на нем нет TON для оплаты газа.";
   }
 
-  if (/429/.test(message)) {
+  if (isTonRpcRateLimit(message)) {
     return "TON RPC временно ограничил запросы. Повторите попытку через 10-20 секунд или добавьте TONCENTER_API_KEY.";
   }
 
@@ -261,6 +294,16 @@ async function mcpCall(toolName, args = {}) {
   return callMcp(toolName, args);
 }
 
+async function fetchToncenterJson(url, label) {
+  return withTonRpcRetry(label, async () => {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`TonCenter HTTP ${response.status}`);
+    }
+    return response.json();
+  });
+}
+
 async function buildDirectWalletContext() {
   const mnemonic = process.env.MNEMONIC?.trim();
   if (!mnemonic) {
@@ -305,7 +348,10 @@ async function buildDirectWalletContext() {
 
   for (const candidate of candidates) {
     try {
-      const balance = await client.getBalance(candidate.wallet.address);
+      const balance = await withTonRpcRetry(
+        `buildDirectWalletContext:getBalance:${candidate.version}`,
+        () => client.getBalance(candidate.wallet.address),
+      );
       if (!selected || balance > selected.balance) {
         selected = { ...candidate, balance };
       }
@@ -344,48 +390,106 @@ async function waitForSeqnoChange(openedWallet, initialSeqno) {
   const timeoutAt = Date.now() + 60_000;
 
   while (Date.now() < timeoutAt) {
-    const currentSeqno = await openedWallet.getSeqno();
-    if (currentSeqno > initialSeqno) {
-      return currentSeqno;
+    try {
+      const currentSeqno = await withTonRpcRetry(
+        "waitForSeqnoChange:getSeqno",
+        () => openedWallet.getSeqno(),
+        { attempts: 3, baseDelayMs: 1200 },
+      );
+      if (currentSeqno > initialSeqno) {
+        return currentSeqno;
+      }
+    } catch (error) {
+      if (!isTonRpcRateLimit(error)) {
+        throw error;
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await sleep(2500);
   }
 
   throw new Error("Timed out waiting for transaction confirmation");
 }
 
 async function findLatestWalletTxHash(client, walletAddress) {
-  const transactions = await client.getTransactions(walletAddress, {
-    limit: 5,
-    archival: true,
-  });
+  const transactions = await withTonRpcRetry(
+    "findLatestWalletTxHash:getTransactions",
+    () => client.getTransactions(walletAddress, {
+      limit: 5,
+      archival: true,
+    }),
+  );
 
   const latest = transactions[0];
   return latest ? latest.hash().toString("hex") : null;
 }
 
+async function sendTransferWithRetry(openedWallet, secretKey, seqno, message) {
+  const attempts = 3;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await openedWallet.sendTransfer({
+        secretKey,
+        seqno,
+        sendMode: SendMode.PAY_GAS_SEPARATELY,
+        messages: [message],
+      });
+      return;
+    } catch (error) {
+      if (!isTonRpcRateLimit(error) || attempt === attempts) {
+        throw error;
+      }
+
+      logger.warn(`[TON RPC] sendDirectTon:sendTransfer rate-limited on attempt ${attempt}/${attempts}`);
+
+      try {
+        const currentSeqno = await withTonRpcRetry(
+          "sendDirectTon:postErrorGetSeqno",
+          () => openedWallet.getSeqno(),
+          { attempts: 2, baseDelayMs: 1000 },
+        );
+        if (currentSeqno > seqno) {
+          logger.info("[TON RPC] sendTransfer likely succeeded despite rate limit; seqno already advanced");
+          return;
+        }
+      } catch (seqnoError) {
+        if (!isTonRpcRateLimit(seqnoError)) {
+          throw seqnoError;
+        }
+      }
+
+      await sleep(1500 * attempt);
+    }
+  }
+}
+
 async function sendDirectTon({ to, amountTon, memo }) {
   const { client, keyPair, wallet } = await getDirectWalletContext();
 
-  if ((await client.getBalance(wallet.address)) <= 0n) {
+  const walletBalance = await withTonRpcRetry(
+    "sendDirectTon:getBalance",
+    () => client.getBalance(wallet.address),
+  );
+  if (walletBalance <= 0n) {
     throw new Error("Платформенный кошелек пуст. Пополните его testnet TON перед выплатой.");
   }
 
   const openedWallet = client.open(wallet);
-  const seqno = await openedWallet.getSeqno();
+  const seqno = await withTonRpcRetry(
+    "sendDirectTon:getSeqno",
+    () => openedWallet.getSeqno(),
+  );
 
-  await openedWallet.sendTransfer({
-    secretKey: keyPair.secretKey,
+  await sendTransferWithRetry(
+    openedWallet,
+    keyPair.secretKey,
     seqno,
-    sendMode: SendMode.PAY_GAS_SEPARATELY,
-    messages: [
-      internal({
-        to: Address.parse(to),
-        value: toNano(String(amountTon)),
-        body: memo ? comment(memo) : undefined,
-      }),
-    ],
-  });
+    internal({
+      to: Address.parse(to),
+      value: toNano(String(amountTon)),
+      body: memo ? comment(memo) : undefined,
+    }),
+  );
 
   await waitForSeqnoChange(openedWallet, seqno);
   return findLatestWalletTxHash(client, wallet.address);
@@ -549,12 +653,7 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
     url.searchParams.set("api_key", process.env.TONCENTER_API_KEY);
   }
 
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`TonCenter HTTP ${response.status}`);
-  }
-
-  const payload = await response.json();
+  const payload = await fetchToncenterJson(url, "verifyDeposit:getTransactions");
   const transactions = Array.isArray(payload?.result) ? payload.result : [];
   const expectedNano = Math.round(Number(expectedTon) * 1e9);
   const toleranceNano = Math.round(0.005 * 1e9);
@@ -618,12 +717,7 @@ export async function getAddressBalance(address) {
     url.searchParams.set("api_key", process.env.TONCENTER_API_KEY);
   }
 
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`TonCenter HTTP ${response.status}`);
-  }
-
-  const payload = await response.json();
+  const payload = await fetchToncenterJson(url, "getAddressBalance");
   const nano = Number(payload?.result ?? 0);
   return Number.isFinite(nano) ? nano / 1e9 : 0;
 }
@@ -719,8 +813,7 @@ async function verifyTxOnChain(txHash) {
       url.searchParams.set("api_key", process.env.TONCENTER_API_KEY);
     }
 
-    const response = await fetch(url);
-    const data = await response.json();
+    const data = await fetchToncenterJson(url, "verifyTxOnChain:getTransactions");
     if (!data?.ok) {
       return false;
     }
