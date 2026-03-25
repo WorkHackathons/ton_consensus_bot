@@ -122,6 +122,18 @@ function isWinningBetForCurrentUser(bet) {
   return Number(bet.winner_id) === Number(userId);
 }
 
+function isLosingBetForCurrentUser(bet) {
+  if (!bet || !userId || !bet.winner_id) {
+    return false;
+  }
+
+  const isParticipant =
+    Number(bet?.creator_id || 0) === Number(userId)
+    || Number(bet?.opponent_id || 0) === Number(userId);
+
+  return isParticipant && Number(bet.winner_id) !== Number(userId);
+}
+
 function getWinnerPayoutAmount(bet) {
   const pot = Number(bet?.amount_ton || 0) * 2;
   const arbiterResolved = Number(bet?.oracle_votes_count || bet?.oracle_votes?.length || 0) >= 2;
@@ -130,19 +142,39 @@ function getWinnerPayoutAmount(bet) {
 }
 
 function buildSuccessState(bet, explicitTxHash = "") {
-  if (!isWinningBetForCurrentUser(bet)) {
-    return null;
+  const txHash = explicitTxHash || bet?.payout_txhash || "";
+  const tonscanUrl = txHash && !isPendingTxHash(txHash) ? `${TONSCAN_BASE}/tx/${txHash}` : "";
+
+  if (isWinningBetForCurrentUser(bet)) {
+    return {
+      variant: "win",
+      amount: getWinnerPayoutAmount(bet),
+      txHash,
+      tonscanUrl,
+    };
   }
 
-  const txHash = explicitTxHash || bet?.payout_txhash || "";
-  return {
-    amount: getWinnerPayoutAmount(bet),
-    txHash,
-    tonscanUrl: txHash && !isPendingTxHash(txHash) ? `${TONSCAN_BASE}/tx/${txHash}` : "",
-  };
+  if (isLosingBetForCurrentUser(bet)) {
+    return {
+      variant: "loss",
+      amount: 0,
+      txHash,
+      tonscanUrl,
+    };
+  }
+
+  return null;
 }
 
-function formatOutcomeChoice(outcome) {
+function formatOutcomeChoice(outcome, role = "creator") {
+  if (!outcome) return "Not submitted";
+
+  if (role === "opponent") {
+    if (outcome === OUTCOME.win) return "Claim FALSE";
+    if (outcome === OUTCOME.lose) return "Claim TRUE";
+    return "Not submitted";
+  }
+
   if (outcome === OUTCOME.win) return "Claim TRUE";
   if (outcome === OUTCOME.lose) return "Claim FALSE";
   return "Not submitted";
@@ -193,6 +225,22 @@ function getResolvedStateBadgeText(bet) {
   }
 
   return "resolution synced";
+}
+
+function getOutcomePayloadForClaim(claimValue, { isCreator, isOpponent }) {
+  if (!isCreator && !isOpponent) {
+    return null;
+  }
+
+  if (claimValue === "true") {
+    return isCreator ? OUTCOME.win : OUTCOME.lose;
+  }
+
+  if (claimValue === "false") {
+    return isCreator ? OUTCOME.lose : OUTCOME.win;
+  }
+
+  return null;
 }
 
 const actionIntroCopy = {
@@ -1531,6 +1579,7 @@ export default function App() {
       {!liteFx ? <div className="pointer-events-none fixed inset-0 z-[999] opacity-[0.04]" style={{ filter: "url(#noise)" }} /> : null}
       <SuccessExplosion
         amount={successState?.amount || 0}
+        variant={successState?.variant || "win"}
         visible={Boolean(successState)}
         txHash={successState?.txHash}
         tonscanUrl={successState?.tonscanUrl}
@@ -1845,15 +1894,21 @@ export default function App() {
                         <div className="mt-3 max-w-2xl text-sm leading-7 text-white/58">{outcomeBody}</div>
                         {hasSubmittedOutcome ? (
                           <div className="mt-5 border border-white/10 bg-white/[0.03] px-4 py-4 font-mono text-[10px] uppercase tracking-[0.18em] text-white/50">
-                            Your claim is locked: {formatOutcomeChoice(mySubmittedOutcome)}. The app is waiting for the other side to answer.
+                            Your claim is locked: {formatOutcomeChoice(mySubmittedOutcome, isOpponent ? "opponent" : "creator")}. The app is waiting for the other side to answer.
                           </div>
                         ) : (
                           <div className="mt-5">
                             <div className="flex flex-wrap gap-3">
-                            <button type="button" onClick={() => handleSubmitOutcome(OUTCOME.win)} disabled={Boolean(actionBusy)} className="rounded-full border border-white bg-white px-5 py-3 font-mono text-[10px] uppercase tracking-[0.22em] text-black disabled:opacity-40">
+                            <button type="button" onClick={() => {
+                              const nextOutcome = getOutcomePayloadForClaim("true", { isCreator, isOpponent });
+                              if (nextOutcome) handleSubmitOutcome(nextOutcome);
+                            }} disabled={Boolean(actionBusy)} className="rounded-full border border-white bg-white px-5 py-3 font-mono text-[10px] uppercase tracking-[0.22em] text-black disabled:opacity-40">
                               Claim TRUE
                             </button>
-                            <button type="button" onClick={() => handleSubmitOutcome(OUTCOME.lose)} disabled={Boolean(actionBusy)} className="rounded-full border border-white/12 px-5 py-3 font-mono text-[10px] uppercase tracking-[0.22em] text-white disabled:opacity-40">
+                            <button type="button" onClick={() => {
+                              const nextOutcome = getOutcomePayloadForClaim("false", { isCreator, isOpponent });
+                              if (nextOutcome) handleSubmitOutcome(nextOutcome);
+                            }} disabled={Boolean(actionBusy)} className="rounded-full border border-white/12 px-5 py-3 font-mono text-[10px] uppercase tracking-[0.22em] text-white disabled:opacity-40">
                               Claim FALSE
                             </button>
                           </div>
@@ -1898,7 +1953,7 @@ export default function App() {
                   <SectionHeader title="Oracle" aside="selected market" />
                   <motion.div className={`panel-surface grid gap-px border ${oracleMode ? "border-[#0098EA]/35" : resolvedFocus ? "border-[#FFD700]/28" : "border-white/10"}`} animate={{ boxShadow: oracleMode ? "inset 0 1px 0 rgba(255,255,255,0.05), 0 24px 90px rgba(0,152,234,0.16)" : resolvedFocus ? "inset 0 1px 0 rgba(255,255,255,0.05), 0 24px 90px rgba(255,215,0,0.12)" : "inset 0 1px 0 rgba(255,255,255,0.05), 0 24px 80px rgba(0,0,0,0.38)" }} transition={{ duration: 0.35, ease: "easeOut" }}>
                     <div className="p-5 md:p-6">
-                      <AnimatePresence mode="wait"><motion.div key={selectedBet ? selectedBet.id : "empty-oracle"} initial={{ opacity: 0, y: 14, scale: 0.99 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -14, scale: 0.99 }} transition={{ duration: 0.28 }}>{selectedBet ? <div className={`relative overflow-hidden border p-5 ${oracleMode ? "border-[#0098EA]/24 bg-[radial-gradient(circle_at_top,rgba(0,152,234,0.12),transparent_38%)]" : resolvedFocus ? "border-[#FFD700]/22 bg-[radial-gradient(circle_at_top,rgba(255,215,0,0.10),transparent_40%)]" : "border-white/10 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.05),transparent_38%)]"}`}>{(oracleMode || selectedBet.status === BET_STATUS.done) ? <motion.div className={`pointer-events-none absolute inset-y-0 left-0 w-32 ${resolvedFocus ? "bg-gradient-to-r from-[#FFD700]/16 to-transparent" : "bg-gradient-to-r from-[#0098EA]/12 to-transparent"}`} initial={{ x: "-120%" }} animate={{ x: "240%" }} transition={{ duration: 1.1, ease: "easeOut", repeat: oracleMode ? Infinity : 0, repeatDelay: 2.2 }} /> : null}<div className="flex flex-wrap items-start justify-between gap-5"><div className="min-w-0 flex-1"><div className="font-mono text-[10px] uppercase tracking-[0.24em] text-white/30">market focus</div><div className="market-title-safe display-title mt-3 min-w-0 overflow-hidden text-[24px] font-semibold leading-[1.02] text-white md:text-[36px]">{selectedBet.description}</div><div className="mt-4 inline-flex rounded-full border border-[#0098EA]/20 bg-[#0098EA]/8 px-3 py-2 font-mono text-[10px] uppercase tracking-[0.18em] text-[#8fd9ff]">Powered by AI Oracle</div></div><div className={`flex h-24 w-24 items-center justify-center rounded-full border border-white/10 ${resolvedFocus ? "bg-[radial-gradient(circle_at_30%_30%,rgba(255,215,0,0.18),rgba(255,255,255,0.02)_50%,transparent_72%)]" : "bg-[radial-gradient(circle_at_30%_30%,rgba(0,152,234,0.14),rgba(255,255,255,0.02)_50%,transparent_72%)]"}`}><div className="text-center"><div className="font-mono text-[9px] uppercase tracking-[0.2em] text-white/34">state</div><motion.div className={`mt-1 font-mono text-[11px] uppercase tracking-[0.2em] ${resolvedFocus ? "text-[#FFD700]" : "text-[#0098EA]"}`} animate={oracleMode ? { opacity: [1, 0.5, 1], scale: [1, 1.04, 1] } : resolvedFocus ? { opacity: [1, 0.7, 1], scale: [1, 1.02, 1] } : { opacity: 1, scale: 1 }} transition={{ duration: 1.8, repeat: oracleMode || resolvedFocus ? Infinity : 0, ease: "easeInOut" }}>{selectedStatus}</motion.div></div></div></div><div className="mt-6 grid gap-px border border-white/10 bg-white/5 sm:grid-cols-3"><div className="bg-black p-4"><div className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">bet</div><div className="display-title mt-2 text-[28px] font-semibold text-white">#<CountUp value={selectedBet.id} /></div></div><div className="bg-black p-4"><div className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">stake</div><div className="mt-2 font-mono text-lg uppercase tracking-[0.18em] text-[#0098EA] [text-shadow:0_0_12px_rgba(0,152,234,0.45)]"><CountUp value={selectedBet.amount_ton} suffix=" TON" decimals={1} /></div></div><div className="bg-black p-4"><div className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">pot</div><div className="mt-2 font-mono text-lg uppercase tracking-[0.18em] text-white"><CountUp value={selectedPot} suffix=" TON" decimals={2} /></div></div></div>{disputeMode ? <div className="mt-5 border border-[#0098EA]/22 bg-[#0098EA]/8 p-4"><div className="font-mono text-[10px] uppercase tracking-[0.24em] text-[#8fd9ff]">dispute flow</div><div className="display-title mt-3 text-[24px] font-semibold text-white">Both sides submitted conflicting results.</div><div className="mt-4 grid gap-px border border-[#0098EA]/20 bg-[#0098EA]/8 sm:grid-cols-3"><div className="bg-black/60 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/34">step 1</div><div className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/58">conflict detected</div></div><div className="bg-black/60 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/34">step 2</div><div className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/58">oracle reviews evidence</div></div><div className="bg-black/60 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/34">step 3</div><div className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/58">winner gets paid</div></div></div><div className="mt-4 grid gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/48"><div>Creator submitted: {formatOutcomeChoice(selectedBet.creator_outcome)}</div><div>Opponent submitted: {formatOutcomeChoice(selectedBet.opponent_outcome)}</div><div>The AI oracle is deciding the winner automatically now.</div><div>You do not need to go back to chat. Stay here and watch the status update.</div></div>{oracleMode ? <div className="mt-4 border border-[#0098EA]/20 bg-black/40 p-4"><div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-[0.2em] text-[#8fd9ff]"><span>vote progress</span><span>{oracleVotesCount}/{oracleVotesNeeded}</span></div><div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8"><motion.div className="h-full bg-[#0098EA]" initial={{ width: 0 }} animate={{ width: `${Math.min((oracleVotesCount / oracleVotesNeeded) * 100, 100)}%` }} transition={{ duration: 0.4, ease: "easeOut" }} /></div></div> : null}</div> : null}{oracleMode ? <motion.div className="mt-5 flex items-center justify-between rounded-full border border-[#0098EA]/22 bg-[#0098EA]/8 px-4 py-3 font-mono text-[10px] uppercase tracking-[0.24em] text-[#8fd9ff]" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}><span>oracle mode active</span><span>ai is resolving the dispute</span></motion.div> : null}{resolvedFocus ? <motion.div className="mt-5 flex items-center justify-between rounded-full border border-[#FFD700]/24 bg-[#FFD700]/8 px-4 py-3 font-mono text-[10px] uppercase tracking-[0.24em] text-[#ffe38a]" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}><span>market settled</span><span>{getResolvedStateBadgeText(selectedBet)}</span></motion.div> : null}</div> : <div className="border border-white/10 p-5 font-mono text-[11px] uppercase tracking-[0.22em] text-white/35">Select a market to continue.</div>}</motion.div></AnimatePresence>
+                      <AnimatePresence mode="wait"><motion.div key={selectedBet ? selectedBet.id : "empty-oracle"} initial={{ opacity: 0, y: 14, scale: 0.99 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -14, scale: 0.99 }} transition={{ duration: 0.28 }}>{selectedBet ? <div className={`relative overflow-hidden border p-5 ${oracleMode ? "border-[#0098EA]/24 bg-[radial-gradient(circle_at_top,rgba(0,152,234,0.12),transparent_38%)]" : resolvedFocus ? "border-[#FFD700]/22 bg-[radial-gradient(circle_at_top,rgba(255,215,0,0.10),transparent_40%)]" : "border-white/10 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.05),transparent_38%)]"}`}>{(oracleMode || selectedBet.status === BET_STATUS.done) ? <motion.div className={`pointer-events-none absolute inset-y-0 left-0 w-32 ${resolvedFocus ? "bg-gradient-to-r from-[#FFD700]/16 to-transparent" : "bg-gradient-to-r from-[#0098EA]/12 to-transparent"}`} initial={{ x: "-120%" }} animate={{ x: "240%" }} transition={{ duration: 1.1, ease: "easeOut", repeat: oracleMode ? Infinity : 0, repeatDelay: 2.2 }} /> : null}<div className="flex flex-wrap items-start justify-between gap-5"><div className="min-w-0 flex-1"><div className="font-mono text-[10px] uppercase tracking-[0.24em] text-white/30">market focus</div><div className="market-title-safe display-title mt-3 min-w-0 overflow-hidden text-[24px] font-semibold leading-[1.02] text-white md:text-[36px]">{selectedBet.description}</div><div className="mt-4 inline-flex rounded-full border border-[#0098EA]/20 bg-[#0098EA]/8 px-3 py-2 font-mono text-[10px] uppercase tracking-[0.18em] text-[#8fd9ff]">Powered by AI Oracle</div></div><div className={`flex h-24 w-24 items-center justify-center rounded-full border border-white/10 ${resolvedFocus ? "bg-[radial-gradient(circle_at_30%_30%,rgba(255,215,0,0.18),rgba(255,255,255,0.02)_50%,transparent_72%)]" : "bg-[radial-gradient(circle_at_30%_30%,rgba(0,152,234,0.14),rgba(255,255,255,0.02)_50%,transparent_72%)]"}`}><div className="text-center"><div className="font-mono text-[9px] uppercase tracking-[0.2em] text-white/34">state</div><motion.div className={`mt-1 font-mono text-[11px] uppercase tracking-[0.2em] ${resolvedFocus ? "text-[#FFD700]" : "text-[#0098EA]"}`} animate={oracleMode ? { opacity: [1, 0.5, 1], scale: [1, 1.04, 1] } : resolvedFocus ? { opacity: [1, 0.7, 1], scale: [1, 1.02, 1] } : { opacity: 1, scale: 1 }} transition={{ duration: 1.8, repeat: oracleMode || resolvedFocus ? Infinity : 0, ease: "easeInOut" }}>{selectedStatus}</motion.div></div></div></div><div className="mt-6 grid gap-px border border-white/10 bg-white/5 sm:grid-cols-3"><div className="bg-black p-4"><div className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">bet</div><div className="display-title mt-2 text-[28px] font-semibold text-white">#<CountUp value={selectedBet.id} /></div></div><div className="bg-black p-4"><div className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">stake</div><div className="mt-2 font-mono text-lg uppercase tracking-[0.18em] text-[#0098EA] [text-shadow:0_0_12px_rgba(0,152,234,0.45)]"><CountUp value={selectedBet.amount_ton} suffix=" TON" decimals={1} /></div></div><div className="bg-black p-4"><div className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">pot</div><div className="mt-2 font-mono text-lg uppercase tracking-[0.18em] text-white"><CountUp value={selectedPot} suffix=" TON" decimals={2} /></div></div></div>{disputeMode ? <div className="mt-5 border border-[#0098EA]/22 bg-[#0098EA]/8 p-4"><div className="font-mono text-[10px] uppercase tracking-[0.24em] text-[#8fd9ff]">dispute flow</div><div className="display-title mt-3 text-[24px] font-semibold text-white">Both sides submitted conflicting results.</div><div className="mt-4 grid gap-px border border-[#0098EA]/20 bg-[#0098EA]/8 sm:grid-cols-3"><div className="bg-black/60 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/34">step 1</div><div className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/58">conflict detected</div></div><div className="bg-black/60 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/34">step 2</div><div className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/58">oracle reviews evidence</div></div><div className="bg-black/60 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/34">step 3</div><div className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/58">winner gets paid</div></div></div><div className="mt-4 grid gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/48"><div>Creator submitted: {formatOutcomeChoice(selectedBet.creator_outcome, "creator")}</div><div>Opponent submitted: {formatOutcomeChoice(selectedBet.opponent_outcome, "opponent")}</div><div>The AI oracle is deciding the winner automatically now.</div><div>You do not need to go back to chat. Stay here and watch the status update.</div></div>{oracleMode ? <div className="mt-4 border border-[#0098EA]/20 bg-black/40 p-4"><div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-[0.2em] text-[#8fd9ff]"><span>vote progress</span><span>{oracleVotesCount}/{oracleVotesNeeded}</span></div><div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8"><motion.div className="h-full bg-[#0098EA]" initial={{ width: 0 }} animate={{ width: `${Math.min((oracleVotesCount / oracleVotesNeeded) * 100, 100)}%` }} transition={{ duration: 0.4, ease: "easeOut" }} /></div></div> : null}</div> : null}{oracleMode ? <motion.div className="mt-5 flex items-center justify-between rounded-full border border-[#0098EA]/22 bg-[#0098EA]/8 px-4 py-3 font-mono text-[10px] uppercase tracking-[0.24em] text-[#8fd9ff]" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}><span>oracle mode active</span><span>ai is resolving the dispute</span></motion.div> : null}{resolvedFocus ? <motion.div className="mt-5 flex items-center justify-between rounded-full border border-[#FFD700]/24 bg-[#FFD700]/8 px-4 py-3 font-mono text-[10px] uppercase tracking-[0.24em] text-[#ffe38a]" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}><span>market settled</span><span>{getResolvedStateBadgeText(selectedBet)}</span></motion.div> : null}</div> : <div className="border border-white/10 p-5 font-mono text-[11px] uppercase tracking-[0.22em] text-white/35">Select a market to continue.</div>}</motion.div></AnimatePresence>
                     </div>
                     <div className="bg-black px-5 py-5"><div className="font-mono text-[10px] uppercase tracking-[0.24em] text-white/30">in-app flow</div><div className="mt-4 grid gap-3 font-mono text-[11px] uppercase tracking-[0.16em] text-white/45"><div>Create bets here.</div><div>Share invite links here.</div><div>Join, deposit and submit outcomes here.</div></div></div>
                   </motion.div>
