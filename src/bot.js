@@ -629,12 +629,17 @@ bot.action(/^outcome:(\d+):(win|lose)$/, async (ctx) => {
   }
 
   submitOutcome(betId, ctx.from.id, outcome);
-  const resolution = resolveOutcomes(betId);
   const updatedBet = getBet(betId);
 
   await ctx.reply("Your outcome was saved.");
 
-  if (!resolution || !updatedBet) {
+  if (!updatedBet) {
+    return;
+  }
+
+  const resolution = resolveOutcomes(betId);
+
+  if (!resolution) {
     return;
   }
 
@@ -696,6 +701,16 @@ setInterval(async () => {
     try {
       const hasCreatorOutcome = !!bet.creator_outcome;
       const hasOpponentOutcome = !!bet.opponent_outcome;
+
+      if (hasCreatorOutcome && hasOpponentOutcome) {
+        const resolution = resolveOutcomes(bet.id);
+        if (resolution === "dispute") {
+          await startOracleForBet(bet, bot);
+        } else if (resolution) {
+          await handlePayoutForBet(bet, resolution);
+        }
+        continue;
+      }
 
       if (!hasCreatorOutcome && !hasOpponentOutcome) {
         await startOracleForBet(bet, bot);
