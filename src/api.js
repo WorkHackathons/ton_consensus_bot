@@ -428,11 +428,6 @@ export default function createApiRouter(bot) {
       return res.status(404).json({ error: "Bet not found" });
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    if (bet.deadline && Number(bet.deadline) > now) {
-      return res.status(400).json({ error: "Outcome submission opens only after the deadline." });
-    }
-
     if (bet.status !== BET_STATUS.active && bet.status !== BET_STATUS.confirming) {
       return res.status(400).json({ error: "This bet can no longer accept outcomes" });
     }
@@ -449,8 +444,8 @@ export default function createApiRouter(bot) {
     }
 
     submitOutcome(betId, result.data.telegram_id, result.data.outcome);
-    const resolution = resolveOutcomes(betId);
     const updatedBet = getBet(betId);
+    const resolution = resolveOutcomes(betId);
 
     if (!resolution || !updatedBet) {
       return res.json({ ok: true, stage: "waiting", bet: updatedBet });
