@@ -110,7 +110,7 @@ function detectCryptoSymbol(description = "") {
 }
 
 function parseThresholdValue(rawNumber = "", suffix = "") {
-  const numeric = Number(String(rawNumber).replace(/,/g, "").trim());
+  const numeric = Number(String(rawNumber).replace(/[,\s]/g, "").trim());
   if (!Number.isFinite(numeric)) {
     return null;
   }
@@ -131,13 +131,13 @@ function parseCryptoPriceDispute(description = "") {
     return null;
   }
 
-  const comparatorMatch = text.match(/\b(under|below|less than|over|above|greater than)\b\s*\$?\s*([\d.,]+)\s*([km]?)\s*\$?\b/i);
+  const comparatorMatch = text.match(/(?:\b(under|below|less than|over|above|greater than)\b|([<>]))\s*\$?\s*([\d.,\s]+)\s*([km]?)\s*\$?/i);
   if (!comparatorMatch) {
     return null;
   }
 
-  const comparatorWord = comparatorMatch[1].toLowerCase();
-  const threshold = parseThresholdValue(comparatorMatch[2], comparatorMatch[3] || "");
+  const comparatorWord = String(comparatorMatch[1] || comparatorMatch[2] || "").toLowerCase();
+  const threshold = parseThresholdValue(comparatorMatch[3], comparatorMatch[4] || "");
   if (!Number.isFinite(threshold)) {
     return null;
   }
@@ -401,11 +401,12 @@ If you cannot find enough evidence, respond with:
     break;
   }
 
+  const isDirectCryptoDispute = Boolean(parseCryptoPriceDispute(bet.description));
   if (
     !verdict
     || verdict.winner_side === "unknown"
     || Number(verdict.confidence) < 0.85
-    || (Number(verdict.confidence) >= 0.9 && (verdict.sources?.length || 0) < 2)
+    || (!isDirectCryptoDispute && Number(verdict.confidence) >= 0.9 && (verdict.sources?.length || 0) < 2)
   ) {
     logger.warn("[ENGINE] Low confidence or unknown result, routing to human oracle");
     return null;
