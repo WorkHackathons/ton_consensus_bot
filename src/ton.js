@@ -543,7 +543,7 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
   const walletAddress = await getWalletAddress();
   const url = new URL(`${TONCENTER_API_BASE}/getTransactions`);
   url.searchParams.set("address", walletAddress);
-  url.searchParams.set("limit", "30");
+  url.searchParams.set("limit", "100");
 
   if (process.env.TONCENTER_API_KEY) {
     url.searchParams.set("api_key", process.env.TONCENTER_API_KEY);
@@ -558,8 +558,16 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
   const transactions = Array.isArray(payload?.result) ? payload.result : [];
   const expectedNano = Math.round(Number(expectedTon) * 1e9);
   const toleranceNano = Math.round(0.005 * 1e9);
-  const minUnix = Math.max(Number(sinceUnix || 0), Math.floor(Date.now() / 1000) - 600);
+  const requestUnix = Math.floor(Date.now() / 1000);
+  // Allow for clock skew between Render, TonCenter indexing, and the chain itself.
+  // Without a small buffer, deposits sent immediately after market creation can be skipped forever.
+  const minUnix = Math.max(0, Number(sinceUnix || requestUnix) - 180);
   const normalizedFrom = normalizeTonAddress(fromAddress);
+  const amountMatchedFrom = new Set();
+
+  logger.info(
+    `verifyDeposit scanning ${transactions.length} txs for deposit wallet: ${walletAddress}, sender: ${normalizedFrom}, minUnix: ${minUnix}`,
+  );
 
   for (const tx of transactions) {
     const txUnix = Number(tx.utime ?? tx.now ?? 0);
@@ -570,12 +578,17 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
     }
 
     const source = normalizeTonAddress(incoming.source || incoming.src || "");
-    if (!source || source !== normalizedFrom) {
+    const valueNano = Number(incoming.value ?? 0);
+    if (Math.abs(valueNano - expectedNano) > toleranceNano) {
       continue;
     }
 
-    const valueNano = Number(incoming.value ?? 0);
-    if (Math.abs(valueNano - expectedNano) > toleranceNano) {
+    if (source && source !== normalizedFrom) {
+      amountMatchedFrom.add(source);
+      continue;
+    }
+
+    if (!source || source !== normalizedFrom) {
       continue;
     }
 
@@ -583,6 +596,11 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
     return tx.transaction_id?.hash || tx.hash || null;
   }
 
+  if (amountMatchedFrom.size > 0) {
+    logger.warn(
+      `verifyDeposit found matching amount from different sender(s): ${Array.from(amountMatchedFrom).join(", ")}`,
+    );
+  }
   logger.warn(`verifyDeposit failed to find matching transaction for wallet: ${fromAddress}, amount: ${expectedTon}`);
   return null;
 }
