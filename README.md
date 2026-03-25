@@ -9,11 +9,17 @@
 [![AI Oracle](https://img.shields.io/badge/AI-Oracle-111111?style=for-the-badge)](https://openai.com/)
 [![Status](https://img.shields.io/badge/Status-Hackathon%20MVP-0A7B34?style=for-the-badge)](https://github.com/WorkHackathons/ton_consensus_bot)
 
-[Bot](https://t.me/ton_consensus_bot) | [Channel](https://t.me/consensuston) | [Landing](https://tonconsensus.netlify.app/) | [Open App](https://t.me/ton_consensus_bot) | [GitHub](https://github.com/WorkHackathons/ton_consensus_bot)
+[Bot](https://t.me/ton_consensus_bot) | [Channel](https://t.me/consensuston) | [Landing](https://tonconsensus.netlify.app/) | [Open Bot](https://t.me/ton_consensus_bot) | [GitHub](https://github.com/WorkHackathons/ton_consensus_bot)
 
 </div>
 
 ---
+
+<div align="center">
+
+`Live on Telegram` | `AI-first dispute resolution` | `Testnet payouts working`
+
+</div>
 
 > TON Consensus turns informal Telegram bets into a structured, trust-minimized flow.
 
@@ -69,7 +75,7 @@ The result is a product where disputes can be resolved with less trust, less fri
 
 The AI Oracle is the core of TON Consensus.
 
-It is not a single text completion. It is a tool-driven resolution system that:
+It is not a single text completion. It is a tool-driven resolution system with factual fast paths and evidence search that:
 - reads the disputed claim
 - understands the event and deadline
 - searches the web for evidence
@@ -119,12 +125,14 @@ Human arbiters are best for:
 Text diagram:
 
 ```text
-Telegram Bot -> Telegram Mini App -> API -> SQLite
+Telegram Bot + Express API -> SQLite
+Telegram Bot -> onboarding, invites, notifications, arbiter voting
+Telegram Mini App -> authenticated API via Telegram initData
 Mini App -> TON Connect -> user wallet
-API -> AI Oracle Engine
-AI Oracle Engine -> Tavily + OpenAI + CoinGecko
-API -> TON wallet layer -> on-chain payout / refund
-Low confidence -> anonymous arbiters in Telegram
+API + Bot -> AI Oracle Engine
+AI Oracle Engine -> factual fast paths + Tavily + OpenAI + CoinGecko
+API + Bot -> TON wallet layer -> payout / refund / pending-address fallback
+Low confidence -> assigned anonymous arbiters
 Final result -> Telegram notifications + Tonscan transaction link
 ```
 
@@ -148,7 +156,9 @@ It is used for:
 TON Consensus is built to feel native inside Telegram:
 - `/start` onboarding with video
 - Mini App entry directly from the bot
+- secure Telegram session auth for the Mini App API
 - deep-link invite flow
+- Telegram-native share flow
 - create / join / deposit / resolve inside the app
 - Telegram notifications for dispute and payout events
 - arbiter vote flow inside Telegram chat
@@ -177,16 +187,19 @@ Recommended two-account demo:
 Live now:
 - Telegram bot onboarding
 - Telegram Mini App
+- secure Telegram session auth for the Mini App API
 - create / join / share market flow
+- Telegram deep-link invite flow
 - TON wallet connection
-- deposit verification
+- on-chain deposit verification
 - deadline selection
 - outcome submission
-- AI-first dispute resolution
+- AI-first dispute resolution with factual fast paths
 - anonymous arbiter fallback
-- premium arbiters
-- referral links
+- referral links and referral earnings
+- `/mystats` with arbiter accuracy and referral stats
 - payout success screen with tx hash
+- completed/refunded bet removal from personal list
 - self-test and runtime monitoring
 
 ## Roadmap
@@ -199,7 +212,7 @@ Live now:
 - [x] Anonymous community oracle with 3 arbiters
 - [x] Automatic TON payouts
 - [x] Referral system with automatic rewards
-- [x] Premium arbiter program for core operators
+- [x] Priority arbiter seeding for core operators
 - [x] Telegram Mini App with end-to-end dispute flow
 - [x] Self-test and runtime health monitoring
 
@@ -273,12 +286,16 @@ Referral model:
 npm install
 cp .env.example .env
 
+# Optional: MCP mode
 # Terminal 1
 npx @ton/mcp@0.1.15-alpha.0 --http 3000
 
+# Default runtime: direct wallet mode
 # Terminal 2
 npm run dev
 ```
+
+Direct wallet mode is the default. Run `@ton/mcp` only if you want MCP mode locally.
 
 ## Environment
 
@@ -302,7 +319,6 @@ Core variables:
 | Bot | https://t.me/ton_consensus_bot |
 | Channel | https://t.me/consensuston |
 | Landing | https://tonconsensus.netlify.app/ |
-| Open App | https://t.me/ton_consensus_bot |
 | GitHub | https://github.com/WorkHackathons/ton_consensus_bot |
 
 ## Team
