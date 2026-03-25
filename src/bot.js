@@ -1,4 +1,4 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 import express from "express";
 import { Markup, Telegraf } from "telegraf";
 import {
@@ -40,6 +40,7 @@ if (!token) {
 const bot = new Telegraf(token);
 const TONSCAN = process.env.NETWORK === "mainnet" ? "https://tonscan.org" : "https://testnet.tonscan.org";
 const ARBITER_INVITE_IMAGE = "https://github.com/WorkHackathons/ton_consensus_bot/blob/main/photo_2026-03-20_23-19-26.jpg?raw=true";
+const BET_SHARE_IMAGE = "https://raw.githubusercontent.com/WorkHackathons/ton_consensus_bot/main/photo_2026-03-20_18-21-48.jpg";
 const arbiterInviteTimers = new Map();
 
 function escapeMarkdown(text = "") {
@@ -79,6 +80,41 @@ for (const id of premiumIds) {
     becomeArbiter(id);
   } catch {
   }
+}
+
+function canAccessBetShareCard(bet, telegramId) {
+  return Boolean(
+    bet
+      && telegramId
+      && (
+        Number(bet.creator_id) === Number(telegramId)
+        || Number(bet.opponent_id) === Number(telegramId)
+      )
+  );
+}
+
+function buildBetShareCaption(bet) {
+  return `*I challenge you to a bet!*\n\n`
+    + `_${escapeMarkdown(bet.description)}_\n\n`
+    + `*${bet.amount_ton} TON* each\n\n`
+    + `Accept the challenge below.`;
+}
+
+async function sendBetShareCard(chatId, bet) {
+  await bot.telegram.sendPhoto(
+    chatId,
+    BET_SHARE_IMAGE,
+    {
+      caption: buildBetShareCaption(bet),
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [[{
+          text: "Accept Bet",
+          url: `https://t.me/ton_consensus_bot?start=join_${bet.id}`,
+        }]],
+      },
+    },
+  );
 }
 
 logger.info(`[PREMIUM] ${premiumIds.length} premium arbiters initialized`);
@@ -214,6 +250,18 @@ bot.start(async (ctx) => {
     if (Number.isInteger(betId) && betId > 0) {
       appUrl = buildAppUrl(`?bet=${betId}`);
     }
+  } else if (payload.startsWith("share_")) {
+    const betId = Number(payload.replace("share_", ""));
+    const bet = getBet(betId);
+
+    if (!canAccessBetShareCard(bet, ctx.from.id)) {
+      await ctx.reply("Only participants can generate a rich share card for this bet.");
+      return;
+    }
+
+    await sendBetShareCard(ctx.chat.id, bet);
+    await ctx.reply("Forward this card to your opponent from iPhone share mode.");
+    return;
   }
 
   if (!appUrl) {
@@ -337,21 +385,15 @@ bot.on("inline_query", async (ctx) => {
     return;
   }
 
-  const logoUrl = "https://raw.githubusercontent.com/WorkHackathons/ton_consensus_bot/main/photo_2026-03-20_18-21-48.jpg";
-
   await ctx.answerInlineQuery([
     {
       type: "photo",
       id: String(bet.id),
       title: `Bet #${bet.id}: ${bet.description}`,
       description: `${bet.amount_ton} TON each`,
-      photo_url: logoUrl,
-      thumbnail_url: logoUrl,
-      caption:
-        `*I challenge you to a bet!*\n\n` +
-        `_${escapeMarkdown(bet.description)}_\n\n` +
-        `*${bet.amount_ton} TON* each\n\n` +
-        `Accept the challenge below.`,
+      photo_url: BET_SHARE_IMAGE,
+      thumbnail_url: BET_SHARE_IMAGE,
+      caption: buildBetShareCaption(bet),
       parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [[{
