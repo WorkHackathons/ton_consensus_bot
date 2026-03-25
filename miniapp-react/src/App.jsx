@@ -1451,6 +1451,9 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to submit outcome");
       tg?.HapticFeedback?.notificationOccurred("success");
+      if (data.stage === "locked") {
+        flashStatusNotice("info", "Claim locked. Settlement will start automatically after the deadline.");
+      }
       if (data.stage === "settled" && data.txHash) {
         const nextSuccessState = buildSuccessState(data.bet || selectedBet, data.txHash);
         if (nextSuccessState) {
@@ -1539,7 +1542,6 @@ export default function App() {
   const canResolve = Boolean(
     selectedBet
     && isParticipant
-    && selectedExpired
     && (selectedBet.status === BET_STATUS.active || selectedBet.status === BET_STATUS.confirming)
     && !hasSubmittedOutcome,
   );
@@ -1553,9 +1555,9 @@ export default function App() {
   const roleLabel = isCreator ? "creator" : isOpponent ? "opponent" : "observer";
   const outcomeTitle = isParticipant ? "Mark the statement TRUE or FALSE" : "Outcome flow";
   const outcomeBody = isCreator
-    ? "You opened this market. Confirm whether the statement ended up TRUE or FALSE after the deadline passes. You are not choosing who gets paid; you are confirming the real-world result once."
+    ? "You opened this market. You can lock your TRUE or FALSE claim at any time. Settlement starts only after the deadline, so you are not choosing who gets paid early."
     : isOpponent
-      ? "You joined this market. Confirm whether the statement ended up TRUE or FALSE after the deadline passes. TRUE means it happened. FALSE means it did not."
+      ? "You joined this market. You can lock your TRUE or FALSE claim at any time. TRUE means it happened. FALSE means it did not. Settlement starts only after the deadline."
       : "Only active participants can submit the final result.";
   const oracleVotesCount = Number(selectedBet?.oracle_votes_count || 0);
   const oracleVotesNeeded = Number(selectedBet?.oracle_votes_needed || 2);
@@ -1929,10 +1931,10 @@ export default function App() {
                           </div>
                         </div>
                         <div className="mt-4 grid gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/42">
-                          <div>1. You mark the statement TRUE or FALSE once</div>
-                          <div>2. The counterparty marks theirs</div>
-                          <div>3. Matching claims settle instantly</div>
-                          <div>4. Conflicting claims trigger oracle mode</div>
+                          <div>1. You lock your TRUE or FALSE claim once</div>
+                          <div>2. The counterparty locks theirs</div>
+                          <div>3. After the deadline, matching claims settle automatically</div>
+                          <div>4. After the deadline, conflicting claims trigger oracle mode</div>
                         </div>
                       </div>
                     </div>
