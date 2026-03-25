@@ -1288,10 +1288,16 @@ export default function App() {
   const handleShareSelected = async () => {
     if (!selectedBet) return;
     const inviteUrl = `https://t.me/ton_consensus_bot?start=join_${selectedBet.id}`;
-    const richShareBotUrl = `https://t.me/ton_consensus_bot?start=share_${selectedBet.id}`;
+    const shareCopy =
+      `⚖️ TON Consensus Challenge\n\n` +
+      `"${selectedBet.description}"\n\n` +
+      `Stake: ${selectedBet.amount_ton} TON each\n` +
+      `Bet #${selectedBet.id}\n` +
+      `AI Oracle resolves the dispute if both sides disagree.\n\n` +
+      `Open the Telegram bot below to accept this challenge.`;
     const shareUrl =
       `https://t.me/share/url?url=${encodeURIComponent(inviteUrl)}` +
-      `&text=${encodeURIComponent(`I challenge you to a bet!\n\n"${selectedBet.description}"\n${selectedBet.amount_ton} TON each\n\nAccept the challenge below.`)}`;
+      `&text=${encodeURIComponent(shareCopy)}`;
     tg?.HapticFeedback?.impactOccurred("light");
     const isIosWebView = tg?.platform === "ios" || /iPad|iPhone|iPod/i.test(window.navigator.userAgent || "");
 
@@ -1299,14 +1305,6 @@ export default function App() {
       setShareFlash(true);
       window.setTimeout(() => setShareFlash(false), 1600);
       tg.switchInlineQuery(`bet_${selectedBet.id}`, ["users", "groups", "channels"]);
-      return;
-    }
-
-    if (isIosWebView && tg?.openTelegramLink) {
-      setShareFlash(true);
-      window.setTimeout(() => setShareFlash(false), 1600);
-      tg.openTelegramLink(richShareBotUrl);
-      setAppError("iPhone mode: the bot will send you a rich share card with the bet image. Forward that message to your opponent.");
       return;
     }
 
