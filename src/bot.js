@@ -94,9 +94,11 @@ function canAccessBetShareCard(bet, telegramId) {
 }
 
 function buildBetShareCaption(bet) {
-  return `*I challenge you to a bet!*\n\n`
+  return `*⚖️ TON Consensus Challenge*\n\n`
     + `_${escapeMarkdown(bet.description)}_\n\n`
-    + `*${bet.amount_ton} TON* each\n\n`
+    + `*Stake:* ${bet.amount_ton} TON each\n`
+    + `*Bet:* #${bet.id}\n`
+    + `*AI Oracle:* resolves the dispute if both sides disagree\n\n`
     + `Accept the challenge below.`;
 }
 
