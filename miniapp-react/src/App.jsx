@@ -115,6 +115,12 @@ function isPendingTxHash(value = "") {
   return typeof value === "string" && value.startsWith("pending");
 }
 
+function isStatusVisibleInTab(activeTab, status) {
+  if (!status) return false;
+  if (status === activeTab) return true;
+  return activeTab === BET_STATUS.done && status === BET_STATUS.refunded;
+}
+
 function isWinningBetForCurrentUser(bet) {
   if (!bet || !userId || !bet.winner_id) {
     return false;
@@ -997,14 +1003,15 @@ export default function App() {
       setAppError("");
     }
     try {
-      let data = [];
+      let allData = [];
+      let visibleData = [];
       if (userId) {
         const userRes = await apiFetch(`${API}/api/bets/user/${userId}`);
         const userRaw = await userRes.json();
         if (!userRes.ok) throw new Error(userRaw.error || "Failed to load bets");
-        data = userRaw.filter((bet) => {
-          if (bet.status === tab) return true;
-          if (tab === BET_STATUS.done && bet.status === BET_STATUS.refunded) return true;
+        allData = Array.isArray(userRaw) ? userRaw : [];
+        visibleData = allData.filter((bet) => {
+          if (isStatusVisibleInTab(tab, bet.status)) return true;
           if (forceIncludePreferred && preferredBetId && Number(bet.id) === Number(preferredBetId)) return true;
           return false;
         });
@@ -1013,10 +1020,11 @@ export default function App() {
         const res = await apiFetch(`${API}/api/bets?status=${tab}`);
         const raw = await res.json();
         if (!res.ok) throw new Error(raw.error || "Failed to load bets");
-        data = raw;
+        allData = Array.isArray(raw) ? raw : [];
+        visibleData = allData;
       }
       const nextMap = new Map();
-      data.forEach((bet) => {
+      allData.forEach((bet) => {
         const prev = prevStatusesRef.current.get(bet.id);
         if (prev && prev !== BET_STATUS.done && bet.status === BET_STATUS.done) {
           const nextSuccessState = buildSuccessState(bet);
@@ -1026,54 +1034,44 @@ export default function App() {
         }
         nextMap.set(bet.id, bet.status);
       });
+      const currentSelectedId = Number(selectedBet?.id || 0);
+      const findBetById = (betId) => allData.find((bet) => Number(bet.id) === Number(betId));
+      const keepVisible = (bet) => {
+        if (!bet) return null;
+        if (!isStatusVisibleInTab(tab, bet.status)) {
+          setTab(bet.status);
+        }
+        return bet;
+      };
+      const nextSelected =
+        keepVisible(directBetLock ? findBetById(directBetLock) : null)
+        || keepVisible(preferredBetId ? findBetById(preferredBetId) : null)
+        || keepVisible(currentSelectedId ? findBetById(currentSelectedId) : null)
+        || keepVisible(persistedBetId ? findBetById(persistedBetId) : null)
+        || keepVisible(visibleData[0] || allData[0] || null)
+        || null;
         startTransition(() => {
           prevStatusesRef.current = nextMap;
-          setCount(data.length);
-          setBets(data);
-          setSelectedBet((current) => {
-            if (!data.length) {
-              if (preferredBetId && current && Number(current.id) === Number(preferredBetId)) {
-                return current;
-              }
-              return null;
-            }
-            if (directBetLock) {
-              const invited = data.find((bet) => Number(bet.id) === Number(directBetLock));
-              if (invited) return invited;
-            }
-            if (preferredBetId) {
-              const preferred = data.find((bet) => Number(bet.id) === Number(preferredBetId));
-              if (preferred) return preferred;
-            }
-            if (current) {
-              const found = data.find((bet) => Number(bet.id) === Number(current.id));
-              if (found) return found;
-            }
-            if (directBetLock) {
-              const fromQuery = data.find((bet) => Number(bet.id) === Number(directBetLock));
-              if (fromQuery) return fromQuery;
-            }
-            if (persistedBetId) {
-              const fromStorage = data.find((bet) => Number(bet.id) === Number(persistedBetId));
-              if (fromStorage) return fromStorage;
-            }
-            return data[0];
-          });
+          setCount(visibleData.length);
+          setBets(visibleData);
+          setSelectedBet(nextSelected);
         });
     } catch (error) {
-      startTransition(() => {
-        setBets([]);
-        setCount(0);
-        setSelectedBet(null);
-        setAppError(error.message || "Failed to load bets");
-      });
+      if (!quiet) {
+        startTransition(() => {
+          setBets([]);
+          setCount(0);
+          setSelectedBet(null);
+          setAppError(error.message || "Failed to load bets");
+        });
+      }
     } finally {
       refreshInFlightRef.current = false;
       if (!quiet) {
         setLoading(false);
       }
     }
-  }, [directBetLock, persistedBetId, tab, userId]);
+  }, [directBetLock, persistedBetId, selectedBet?.id, tab, userId]);
 
   useEffect(() => {
     refreshBets(directBetLock || null, {
@@ -1086,15 +1084,10 @@ export default function App() {
       if (!isDocumentVisible()) {
         return;
       }
-      const selectedMatchesTab = Boolean(
-        selectedBet && (
-          selectedBet.status === tab ||
-          (tab === BET_STATUS.done && selectedBet.status === BET_STATUS.refunded)
-        ),
-      );
-      refreshBets(selectedMatchesTab ? selectedBet?.id : directBetLock || null, {
+      const preferredSelectionId = selectedBet?.id || directBetLock || null;
+      refreshBets(preferredSelectionId, {
         quiet: true,
-        forceIncludePreferred: Boolean(directBetLock),
+        forceIncludePreferred: Boolean(preferredSelectionId),
       });
     }, 10000);
 
@@ -1194,6 +1187,9 @@ export default function App() {
         }
 
         startTransition(() => {
+          if (!isStatusVisibleInTab(tab, data.status)) {
+            setTab(data.status);
+          }
           setSelectedBet((current) => (Number(current?.id) === Number(data.id) ? data : current));
           setBets((current) => current.map((bet) => (Number(bet.id) === Number(data.id) ? { ...bet, ...data } : bet)));
         });
@@ -1212,7 +1208,7 @@ export default function App() {
     }, intervalMs);
 
     return () => window.clearInterval(interval);
-  }, [selectedBet?.id, selectedBet?.status]);
+  }, [selectedBet?.id, selectedBet?.status, tab]);
 
   const setCreateField = (field, value) => {
     setCreateForm((current) => {
@@ -1394,7 +1390,7 @@ export default function App() {
         flashStatusNotice("info", "Challenge accepted. Your side is now unlocked for deposit.");
         setActionIntroOpen(false);
         setSelectedBet(data.bet || selectedBet);
-        await refreshBets(data.bet?.id);
+        await refreshBets(data.bet?.id, { forceIncludePreferred: true });
         window.setTimeout(() => {
           depositGuideRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
         }, 180);
@@ -1429,7 +1425,7 @@ export default function App() {
         setDepositFlash(true);
         window.setTimeout(() => setDepositFlash(false), 1400);
         flashStatusNotice("info", "Deposit verified on-chain.");
-        await refreshBets(data.bet?.id);
+        await refreshBets(data.bet?.id, { forceIncludePreferred: true });
     } catch (error) {
       const friendlyError = humanizeAppError(error.message);
       setAppError(friendlyError);
@@ -1461,7 +1457,7 @@ export default function App() {
           setSuccessState(nextSuccessState);
         }
       }
-      await refreshBets(data.bet?.id || selectedBet.id);
+      await refreshBets(data.bet?.id || selectedBet.id, { forceIncludePreferred: true });
     } catch (error) {
       setAppError(humanizeAppError(error.message));
     } finally {
@@ -1540,20 +1536,26 @@ export default function App() {
   const canJoinSelected = Boolean(selectedBet && userId && !selectedExpired && selectedBet.status === BET_STATUS.pending && !selectedBet.opponent_id && Number(selectedBet.creator_id) !== Number(userId));
   const needsDeposit = Boolean(selectedBet && !selectedExpired && isParticipant && selectedBet.status === BET_STATUS.pending && ((isCreator && !selectedBet.creator_deposit) || (isOpponent && !selectedBet.opponent_deposit)));
   const hasSubmittedOutcome = Boolean(selectedBet && ((isCreator && selectedBet.creator_outcome) || (isOpponent && selectedBet.opponent_outcome)));
-  const canResolve = Boolean(selectedBet && isParticipant && (selectedBet.status === BET_STATUS.active || selectedBet.status === BET_STATUS.confirming) && !hasSubmittedOutcome);
+  const canResolve = Boolean(
+    selectedBet
+    && isParticipant
+    && selectedExpired
+    && (selectedBet.status === BET_STATUS.active || selectedBet.status === BET_STATUS.confirming)
+    && !hasSubmittedOutcome,
+  );
   const showJoinBanner = Boolean(joinFocused && directBetLock && selectedBet && Number(selectedBet.id) === Number(directBetLock));
   const showDepositGuide = Boolean(selectedBet && needsDeposit && (depositMode || Boolean(directBetLock && joinFocused)));
-  const showInviteLoading = Boolean(initialAction === "join" && loading && !selectedBet);
-  const showInviteMissing = Boolean(initialAction === "join" && !loading && !selectedBet);
+  const showInviteLoading = Boolean(initialAction === "join" && directBetLock && loading && !selectedBet);
+  const showInviteMissing = Boolean(initialAction === "join" && directBetLock && !loading && !selectedBet);
   const hasEnoughBalance = typeof walletBalance === "number" && selectedBet ? walletBalance >= Number(selectedBet.amount_ton) : true;
   const depositRetryRemaining = Math.max(0, Math.ceil((depositRetryUntil - Date.now()) / 1000));
   const mySubmittedOutcome = isCreator ? selectedBet?.creator_outcome : isOpponent ? selectedBet?.opponent_outcome : null;
   const roleLabel = isCreator ? "creator" : isOpponent ? "opponent" : "observer";
   const outcomeTitle = isParticipant ? "Mark the statement TRUE or FALSE" : "Outcome flow";
   const outcomeBody = isCreator
-    ? "You opened this market. Confirm whether the statement ended up TRUE or FALSE. You are not choosing who gets paid; you are confirming the real-world result once."
+    ? "You opened this market. Confirm whether the statement ended up TRUE or FALSE after the deadline passes. You are not choosing who gets paid; you are confirming the real-world result once."
     : isOpponent
-      ? "You joined this market. Confirm whether the statement ended up TRUE or FALSE. TRUE means it happened. FALSE means it did not."
+      ? "You joined this market. Confirm whether the statement ended up TRUE or FALSE after the deadline passes. TRUE means it happened. FALSE means it did not."
       : "Only active participants can submit the final result.";
   const oracleVotesCount = Number(selectedBet?.oracle_votes_count || 0);
   const oracleVotesNeeded = Number(selectedBet?.oracle_votes_needed || 2);
