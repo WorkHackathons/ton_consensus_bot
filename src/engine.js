@@ -131,7 +131,7 @@ function parseCryptoPriceDispute(description = "") {
     return null;
   }
 
-  const comparatorMatch = text.match(/\b(under|below|less than|over|above|greater than)\b\s*\$?\s*([\d.,]+)\s*([km]?)\b/i);
+  const comparatorMatch = text.match(/\b(under|below|less than|over|above|greater than)\b\s*\$?\s*([\d.,]+)\s*([km]?)\s*\$?\b/i);
   if (!comparatorMatch) {
     return null;
   }
