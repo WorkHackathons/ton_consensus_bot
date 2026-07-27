@@ -722,33 +722,98 @@ export async function getAddressBalance(address) {
   return Number.isFinite(nano) ? nano / 1e9 : 0;
 }
 
-export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddresses, betId = null }) {
+function preBroadcastSettlementError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.beforeBroadcast = true;
+  return error;
+}
+
+function financialTransferError(error, { partialTransfer = false, transferKey = null } = {}) {
+  const wrapped = new Error(humanizeTonError(error));
+  for (const key of ["beforeBroadcast", "partialTransfer", "transferKey", "code"]) {
+    if (error?.[key] !== undefined) wrapped[key] = error[key];
+  }
+  if (partialTransfer) wrapped.partialTransfer = true;
+  if (transferKey && !wrapped.transferKey) wrapped.transferKey = transferKey;
+  return wrapped;
+}
+
+async function getSettlementReceiptContext(betId) {
+  const normalizedBetId = Number(betId);
+  if (!Number.isInteger(normalizedBetId) || normalizedBetId <= 0) {
+    throw preBroadcastSettlementError("SETTLEMENT_RECEIPT_CONTEXT_REQUIRED", "Settlement transfers require a claimed bet id");
+  }
+
+  const database = getDatabase();
+  const bet = await database.bets.getById(normalizedBetId);
+  if (!bet || bet.status !== "settling" || !bet.settlement_kind) {
+    throw preBroadcastSettlementError("SETTLEMENT_RECEIPT_NOT_CLAIMED", "Settlement transfers require a claimed settlement");
+  }
+  return { database, bet };
+}
+
+async function recordSettlementTransfer(context, { transferKey, recipientRole, amountTon, txHash }) {
+  const normalizedHash = typeof txHash === "string" ? txHash.trim() : "";
+  if (!normalizedHash) {
+    const error = new Error("Successful transfer did not return a transaction hash");
+    error.code = "TRANSFER_HASH_MISSING";
+    error.transferKey = transferKey;
+    throw error;
+  }
+  await context.database.settlements.recordTransferReceipt(context.bet.id, {
+    settlementKind: context.bet.settlement_kind,
+    transferKey,
+    recipientRole,
+    amountTon,
+    txHash: normalizedHash,
+  });
+}
+
+export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddresses, betId = null, transferFn = sendTonViaBestMethod }) {
   logger.info(`Starting payout for bet_id: ${betId ?? "unknown"}`);
+  let successfulTransfer = false;
+  let transferKey = "winner";
   try {
     const totalPot = Number(potTon);
     const winnerRatio = oracleUsed ? WINNER_GETS : AI_WINNER_GETS;
     const winnerAmount = Number((totalPot * winnerRatio).toFixed(9));
     const platformBaseAmount = Number((totalPot * PLATFORM_FEE).toFixed(9));
-    const database = getDatabase();
-    const bet = betId ? await database.bets.getById(betId) : null;
-    const referrer = bet ? (await database.referrals.get(bet.creator_id) || await database.referrals.get(bet.opponent_id)) : null;
+    const context = await getSettlementReceiptContext(betId);
+    const { database, bet } = context;
+    const referrer = await database.referrals.get(bet.creator_id) || await database.referrals.get(bet.opponent_id);
     const referralAmount = referrer ? Number((platformBaseAmount * REFERRAL_FEE).toFixed(9)) : 0;
     const platformAmount = Number(Math.max(platformBaseAmount - referralAmount, 0).toFixed(9));
     const arbiterPool = oracleUsed ? Number((totalPot * ARBITER_FEE).toFixed(9)) : 0;
     const winnerComment = oracleUsed ? "TON Consensus payout with oracle" : "TON Consensus payout";
 
-    const winnerTxHash = await sendTonViaBestMethod({
+    const winnerTxHash = await transferFn({
       toAddress: winnerAddress,
       amountTon: winnerAmount,
       comment: winnerComment,
     });
+    successfulTransfer = true;
+    await recordSettlementTransfer(context, {
+      transferKey,
+      recipientRole: "winner",
+      amountTon: winnerAmount,
+      txHash: winnerTxHash,
+    });
 
     let platformTxHash = null;
     if (PLATFORM_WALLET && platformAmount > 0.005) {
-      platformTxHash = await sendTonViaBestMethod({
+      transferKey = "platform_fee";
+      platformTxHash = await transferFn({
         toAddress: PLATFORM_WALLET,
         amountTon: platformAmount,
         comment: "TON Consensus platform fee",
+      });
+      successfulTransfer = true;
+      await recordSettlementTransfer(context, {
+        transferKey,
+        recipientRole: "platform",
+        amountTon: platformAmount,
+        txHash: platformTxHash,
       });
     }
 
@@ -756,10 +821,18 @@ export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddress
     if (referrer && referralAmount > 0.005) {
       const referrerAddress = await database.users.getTonAddress(referrer);
       if (referrerAddress) {
-        referralTxHash = await sendTonViaBestMethod({
+        transferKey = `referral:${referrer}`;
+        referralTxHash = await transferFn({
           toAddress: referrerAddress,
           amountTon: referralAmount,
           comment: "TON Consensus referral reward",
+        });
+        successfulTransfer = true;
+        await recordSettlementTransfer(context, {
+          transferKey,
+          recipientRole: "referrer",
+          amountTon: referralAmount,
+          txHash: referralTxHash,
         });
         await database.referrals.incrementEarnings(referrer, referralAmount);
       }
@@ -771,12 +844,21 @@ export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddress
       const validArbiters = (arbiterAddresses || []).filter(Boolean);
       if (validArbiters.length > 0) {
         const share = Number((arbiterPool / validArbiters.length).toFixed(9));
-        for (const address of validArbiters) {
-          arbiterTxHashes.push(await sendTonViaBestMethod({
+        for (const [index, address] of validArbiters.entries()) {
+          transferKey = `arbiter:${index}`;
+          const arbiterTxHash = await transferFn({
             toAddress: address,
             amountTon: share,
             comment: "TON Consensus arbiter reward",
-          }));
+          });
+          successfulTransfer = true;
+          await recordSettlementTransfer(context, {
+            transferKey,
+            recipientRole: "arbiter",
+            amountTon: share,
+            txHash: arbiterTxHash,
+          });
+          arbiterTxHashes.push(arbiterTxHash);
         }
       }
     }
@@ -794,9 +876,9 @@ export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddress
     logger.info(`payout completed successfully: ${winnerTxHash}`);
     return result;
   } catch (error) {
-    const message = humanizeTonError(error);
-    logger.error(`payout failed for bet_id: ${betId ?? "unknown"}, reason: ${message}`);
-    throw new Error(message);
+    const settlementError = financialTransferError(error, { partialTransfer: successfulTransfer, transferKey });
+    logger.error(`payout failed for bet_id: ${betId ?? "unknown"}, reason: ${settlementError.message}`);
+    throw settlementError;
   }
 }
 
@@ -827,62 +909,86 @@ async function verifyTxOnChain(txHash) {
   }
 }
 
-export async function executePayout(betId, winnerAddress, potTon) {
+export async function executePayout(betId, winnerAddress, potTon, { transferFn = sendTonViaBestMethod } = {}) {
   logger.info(`[PAYOUT] Bet #${betId} | Pot: ${potTon} TON | Winner: ${redactWalletAddress(winnerAddress)}`);
 
-  const totalPot = Number(potTon);
-  const winnerAmount = Number((totalPot * AI_WINNER_GETS).toFixed(9));
-  const feeBaseAmount = Number((totalPot * PLATFORM_FEE).toFixed(9));
-  const database = getDatabase();
-  const bet = await database.bets.getById(betId);
-  const referrer = bet ? (await database.referrals.get(bet.creator_id) || await database.referrals.get(bet.opponent_id)) : null;
-  let referralTx = null;
-  let referralAmount = referrer ? Number((feeBaseAmount * REFERRAL_FEE).toFixed(9)) : 0;
-  const feeAmount = Number(Math.max(feeBaseAmount - referralAmount, 0).toFixed(9));
-
+  let successfulTransfer = false;
+  let transferKey = "winner";
   let winnerTx = null;
+  let feeTx = null;
+  let referralTx = null;
+  let winnerAmount;
+  let feeAmount;
+  let referralAmount;
   try {
-    winnerTx = await sendTonViaBestMethod({
+    const totalPot = Number(potTon);
+    winnerAmount = Number((totalPot * AI_WINNER_GETS).toFixed(9));
+    const feeBaseAmount = Number((totalPot * PLATFORM_FEE).toFixed(9));
+    const context = await getSettlementReceiptContext(betId);
+    const { database, bet } = context;
+    const referrer = await database.referrals.get(bet.creator_id) || await database.referrals.get(bet.opponent_id);
+    referralAmount = referrer ? Number((feeBaseAmount * REFERRAL_FEE).toFixed(9)) : 0;
+    feeAmount = Number(Math.max(feeBaseAmount - referralAmount, 0).toFixed(9));
+
+    winnerTx = await transferFn({
       toAddress: winnerAddress,
       amountTon: winnerAmount,
       comment: `TON Consensus payout #${betId}`,
     });
+    successfulTransfer = true;
+    await recordSettlementTransfer(context, {
+      transferKey,
+      recipientRole: "winner",
+      amountTon: winnerAmount,
+      txHash: winnerTx,
+    });
     logger.info(`[PAYOUT] Winner TX: ${winnerTx}`);
-  } catch (error) {
-    const message = humanizeTonError(error);
-    logger.error(`[PAYOUT] Winner transfer FAILED: ${message}`);
-    throw new Error(message);
-  }
 
-  let feeTx = null;
-  if (PLATFORM_WALLET && feeAmount > 0.005) {
-    try {
-      feeTx = await sendTonViaBestMethod({
+    if (PLATFORM_WALLET && feeAmount > 0.005) {
+      transferKey = "platform_fee";
+      feeTx = await transferFn({
         toAddress: PLATFORM_WALLET,
         amountTon: feeAmount,
         comment: `TON Consensus fee #${betId}`,
       });
+      successfulTransfer = true;
+      await recordSettlementTransfer(context, {
+        transferKey,
+        recipientRole: "platform",
+        amountTon: feeAmount,
+        txHash: feeTx,
+      });
       logger.info(`[PAYOUT] Fee sent: ${feeAmount} TON`);
-    } catch (error) {
-      logger.warn(`[PAYOUT] Fee transfer failed (non-critical): ${error.message}`);
     }
-  }
 
-  if (referrer) {
-    const referrerAddress = await database.users.getTonAddress(referrer);
-    if (referrerAddress && referralAmount > 0.005) {
-      try {
-        referralTx = await sendTonViaBestMethod({
+    if (referrer) {
+      const referrerAddress = await database.users.getTonAddress(referrer);
+      if (referrerAddress && referralAmount > 0.005) {
+        transferKey = `referral:${referrer}`;
+        referralTx = await transferFn({
           toAddress: referrerAddress,
           amountTon: referralAmount,
           comment: "TON Consensus referral reward",
         });
-        await database.referrals.incrementEarnings(referrer, referralAmount);
+        successfulTransfer = true;
+        await recordSettlementTransfer(context, {
+          transferKey,
+          recipientRole: "referrer",
+          amountTon: referralAmount,
+          txHash: referralTx,
+        });
+        try {
+          await database.referrals.incrementEarnings(referrer, referralAmount);
+        } catch (error) {
+          logger.warn(`[REFERRAL] Accounting failed: ${error?.name || "Error"}`);
+        }
         logger.info(`[REFERRAL] Paid ${referralAmount} TON to referrer ${referrer}`);
-      } catch (error) {
-        logger.error(`[REFERRAL] Payout failed: ${error.message}`);
       }
     }
+  } catch (error) {
+    const settlementError = financialTransferError(error, { partialTransfer: successfulTransfer, transferKey });
+    logger.error(`[PAYOUT] Transfer failed: ${settlementError.message}`);
+    throw settlementError;
   }
 
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -900,90 +1006,65 @@ export async function executePayout(betId, winnerAddress, potTon) {
   };
 }
 
-export async function refundBoth(address1, address2, amountTon) {
+export async function refundBoth(address1, address2, amountTon, {
+  betId = null,
+  recipientRoles = ["creator", "opponent"],
+  transferFn = sendTonViaBestMethod,
+} = {}) {
+  let successfulTransfer = false;
+  let transferKey = "refund:creator";
   try {
+    const context = await getSettlementReceiptContext(betId);
     const results = [];
 
-    for (const address of [address1, address2]) {
-      if (preferDirectWallet()) {
-        try {
-          results.push(await sendDirectTon({
-            to: address,
-            amountTon: Number(Number(amountTon).toFixed(9)),
-            memo: "TON Consensus refund",
-          }));
-          continue;
-        } catch (directError) {
-          if (!hasConfiguredMcp()) {
-            throw directError;
-          }
-        }
-      }
-
-      try {
-        const result = await callMcp("send_ton", {
-          toAddress: address,
-          amount: Number(Number(amountTon).toFixed(9)).toString(),
-          comment: "TON Consensus refund",
-        });
-
-        if (!isSuccessfulToolResult(result)) {
-          throw new Error("MCP refund failed");
-        }
-
-        results.push(extractTxHash(result));
-      } catch {
-        results.push(await sendDirectTon({
-          to: address,
-          amountTon: Number(Number(amountTon).toFixed(9)),
-          memo: "TON Consensus refund",
-        }));
-      }
+    for (const [index, address] of [address1, address2].entries()) {
+      const recipientRole = recipientRoles[index] || `participant_${index + 1}`;
+      transferKey = `refund:${recipientRole}`;
+      const txHash = await transferFn({
+        toAddress: address,
+        amountTon: Number(Number(amountTon).toFixed(9)),
+        comment: "TON Consensus refund",
+      });
+      successfulTransfer = true;
+      await recordSettlementTransfer(context, {
+        transferKey,
+        recipientRole,
+        amountTon,
+        txHash,
+      });
+      results.push(txHash);
     }
 
     return results;
   } catch (error) {
-    throw new Error(humanizeTonError(error));
+    throw financialTransferError(error, { partialTransfer: successfulTransfer, transferKey });
   }
 }
 
-export async function refundSingle(address, amountTon) {
+export async function refundSingle(address, amountTon, {
+  betId = null,
+  recipientRole = "creator",
+  transferFn = sendTonViaBestMethod,
+} = {}) {
+  const transferKey = `refund:${recipientRole}`;
+  let successfulTransfer = false;
   try {
-    if (preferDirectWallet()) {
-      try {
-        return await sendDirectTon({
-          to: address,
-          amountTon: Number(Number(amountTon).toFixed(9)),
-          memo: "TON Consensus refund",
-        });
-      } catch (directError) {
-        if (!hasConfiguredMcp()) {
-          throw directError;
-        }
-      }
-    }
-
-    try {
-      const result = await callMcp("send_ton", {
-        toAddress: address,
-        amount: Number(Number(amountTon).toFixed(9)).toString(),
-        comment: "TON Consensus refund",
-      });
-
-      if (!isSuccessfulToolResult(result)) {
-        throw new Error("MCP refund failed");
-      }
-
-      return extractTxHash(result);
-    } catch {
-      return await sendDirectTon({
-        to: address,
-        amountTon: Number(Number(amountTon).toFixed(9)),
-        memo: "TON Consensus refund",
-      });
-    }
+    const context = await getSettlementReceiptContext(betId);
+    const txHash = await transferFn({
+      toAddress: address,
+      amountTon: Number(Number(amountTon).toFixed(9)),
+      comment: "TON Consensus refund",
+    });
+    successfulTransfer = true;
+    await recordSettlementTransfer(context, {
+      transferKey,
+      recipientRole,
+      amountTon,
+      txHash,
+    });
+    return txHash;
   } catch (error) {
-    throw new Error(humanizeTonError(error));
+    throw financialTransferError(error, { partialTransfer: successfulTransfer, transferKey });
   }
 }
 

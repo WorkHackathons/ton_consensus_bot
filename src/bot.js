@@ -158,7 +158,7 @@ async function handlePayoutForBet(bet, winnerId) {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+    if (!error?.partialTransfer && (error?.beforeBroadcast || error?.code === "PRE_BROADCAST")) {
       await database().bets.markSettlementFailed(claimedBet.id, message);
     } else {
       await database().bets.markSettlementUncertain(claimedBet.id, message);
@@ -187,9 +187,15 @@ export async function refundBetWithClaim(bet, eligibleStatuses, { refundBothFn =
   const opponentAddress = await database().users.getTonAddress(claimedBet.opponent_id);
   try {
     if (claimedBet.creator_deposit && claimedBet.opponent_id && claimedBet.opponent_deposit && creatorAddress && opponentAddress) {
-      await refundBothFn(creatorAddress, opponentAddress, claimedBet.amount_ton);
+      await refundBothFn(creatorAddress, opponentAddress, claimedBet.amount_ton, {
+        betId: claimedBet.id,
+        recipientRoles: ["creator", "opponent"],
+      });
     } else if (claimedBet.creator_deposit && creatorAddress) {
-      await refundSingleFn(creatorAddress, claimedBet.amount_ton);
+      await refundSingleFn(creatorAddress, claimedBet.amount_ton, {
+        betId: claimedBet.id,
+        recipientRole: "creator",
+      });
     }
     const finalization = await database().bets.finalizeClaimedSettlement(claimedBet.id, {
       terminalStatus: BET_STATUS.refunded,
@@ -201,7 +207,7 @@ export async function refundBetWithClaim(bet, eligibleStatuses, { refundBothFn =
     return claimedBet;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+    if (!error?.partialTransfer && (error?.beforeBroadcast || error?.code === "PRE_BROADCAST")) {
       await database().bets.markSettlementFailed(claimedBet.id, message);
     } else {
       await database().bets.markSettlementUncertain(claimedBet.id, message);

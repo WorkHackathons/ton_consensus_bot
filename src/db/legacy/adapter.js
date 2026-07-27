@@ -23,6 +23,7 @@ export async function createLegacyDatabase(options = {}) {
     deposits: { confirm: call(raw.confirmDeposit), areBothConfirmed: call(raw.areBothDeposited), confirmAndMaybeActivate: call(raw.confirmAndMaybeActivate) },
     outcomes: { submit: call(raw.submitOutcome), resolve: call(raw.resolveOutcomes) },
     oracle: { assign: call(raw.assignArbiters), getAssignments: call(raw.getAssignedArbiters), isAssigned: call(raw.isAssignedArbiter), submitVote: call(raw.submitVote), getVotes: call(raw.getVotes), tallyVotes: call(raw.tallyVotes) },
+    settlements: { recordTransferReceipt: call(raw.recordTransferReceipt), getTransferReceipts: call(raw.getTransferReceipts) },
     reporting: { arbiterCount: call(raw.getArbiterCount), completedBetsCount: call(raw.getCompletedBetsCount), arbiterAccuracy: call(raw.getArbiterAccuracy), recordCounts: call(raw.getRecordCounts) },
     test: { removeBets: call(raw.removeBets), removeUsers: call(raw.removeUsers) },
   };

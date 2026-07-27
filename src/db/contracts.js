@@ -16,6 +16,7 @@ export const DATABASE_CONTRACT_OPERATIONS = Object.freeze({
   deposits: ["confirm", "areBothConfirmed", "confirmAndMaybeActivate"],
   outcomes: ["submit", "resolve"],
   oracle: ["assign", "getAssignments", "isAssigned", "submitVote", "getVotes", "tallyVotes"],
+  settlements: ["recordTransferReceipt", "getTransferReceipts"],
   reporting: ["arbiterCount", "completedBetsCount", "arbiterAccuracy", "recordCounts"],
   test: ["removeBets", "removeUsers"],
 });

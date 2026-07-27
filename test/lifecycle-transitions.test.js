@@ -11,6 +11,7 @@ import { closeDatabase, getDatabase, initializeDatabase } from "../src/db/index.
 import {
   configureOracleRetryTimersForTest,
   enableOracleRetryTimers,
+  getActiveOracleRetryCount,
   getOracleRetryTimerCount,
   handleArbiterVote,
   scheduleOracleRetry,
@@ -20,6 +21,7 @@ import { parseConfig } from "../src/runtime/config.js";
 import { createRuntimeState } from "../src/runtime/state.js";
 import { startServer } from "../src/server.js";
 import { BET_STATUS, OUTCOME } from "../src/states.js";
+import { payout, refundBoth } from "../src/ton.js";
 
 const baseEnv = {
   NETWORK: "testnet",
@@ -53,6 +55,19 @@ async function makeOracleBet(database, suffix = "") {
   assert.equal(await database.bets.startOracle(betId), true);
   await database.oracle.assign(betId, [3, 4, 5]);
   assert.equal(await database.oracle.submitVote(betId, 3, 1), true);
+  return betId;
+}
+
+async function makeActiveBet(database, suffix = "") {
+  await database.users.upsert(50, `creator-${suffix}`);
+  await database.users.upsert(51, `opponent-${suffix}`);
+  await database.users.saveTonAddress(50, "EQcreator-refund-wallet");
+  await database.users.saveTonAddress(51, "EQopponent-refund-wallet");
+  const betId = await database.bets.create(50, `Active settlement ${suffix}`, 1, Math.floor(Date.now() / 1000) + 3600);
+  assert.equal((await database.bets.join(betId, 51)).joined, true);
+  await database.deposits.confirmAndMaybeActivate(betId, { role: "creator", participantId: 50 });
+  await database.deposits.confirmAndMaybeActivate(betId, { role: "opponent", participantId: 51 });
+  assert.equal((await database.bets.getById(betId)).status, BET_STATUS.active);
   return betId;
 }
 
@@ -127,6 +142,153 @@ test("settlement failures are fail-closed and never schedule a second payout", a
       });
       assert.equal(payouts, 1);
     }
+  });
+});
+
+test("a partial winner payout retains its receipt and is not retried", async () => {
+  const previousToken = process.env.TELEGRAM_TOKEN;
+  process.env.TELEGRAM_TOKEN = "";
+  try {
+    await withDatabase(async (database, legacyPath) => {
+      const betId = await makeOracleBet(database, "partial-payout");
+      await database.users.saveTonAddress(3, "EQarbiter-one-wallet");
+      const transfers = [];
+      const transferFn = async (transfer) => {
+        transfers.push(transfer);
+        if (transfers.length === 1) return "winner-hash";
+        throw Object.assign(new Error("arbiter transfer rejected"), {
+          beforeBroadcast: true,
+          code: "PRE_BROADCAST",
+        });
+      };
+
+      const result = await handleArbiterVote(betId, 4, 1, botSpy(), {
+        payoutFn: (args) => payout({ ...args, transferFn }),
+      });
+      assert.equal(result.done, false);
+      assert.equal((await database.bets.getById(betId)).status, BET_STATUS.settlement_uncertain);
+      assert.equal(transfers.length, 2);
+      const receipts = await database.settlements.getTransferReceipts(betId);
+      assert.deepEqual(receipts.map((receipt) => [receipt.transfer_key, receipt.tx_hash]), [["winner", "winner-hash"]]);
+
+      await handleArbiterVote(betId, 5, 1, botSpy(), {
+        payoutFn: (args) => payout({ ...args, transferFn }),
+      });
+      assert.equal(transfers.length, 2, "an uncertain settlement must not resend the winner transfer");
+
+      const same = await database.settlements.recordTransferReceipt(betId, {
+        settlementKind: "oracle_payout",
+        transferKey: "winner",
+        recipientRole: "winner",
+        amountTon: 1.8,
+        txHash: "winner-hash",
+      });
+      assert.equal(same.recorded, false);
+      await assert.rejects(
+        database.settlements.recordTransferReceipt(betId, {
+          settlementKind: "oracle_payout",
+          transferKey: "winner",
+          recipientRole: "winner",
+          amountTon: 1.8,
+          txHash: "winner-hash-overwrite",
+        }),
+        (error) => error?.code === "SETTLEMENT_RECEIPT_CONFLICT",
+      );
+
+      await closeDatabase();
+      const reopened = await initializeDatabase({ backend: "legacy", legacyPath });
+      assert.deepEqual(
+        (await reopened.settlements.getTransferReceipts(betId)).map((receipt) => [receipt.transfer_key, receipt.tx_hash]),
+        [["winner", "winner-hash"]],
+      );
+    });
+  } finally {
+    if (previousToken === undefined) delete process.env.TELEGRAM_TOKEN;
+    else process.env.TELEGRAM_TOKEN = previousToken;
+  }
+});
+
+test("a partial two-sided refund retains the first receipt and cannot retry", async () => {
+  const previousToken = process.env.TELEGRAM_TOKEN;
+  process.env.TELEGRAM_TOKEN = "";
+  try {
+    await withDatabase(async (database, legacyPath) => {
+      const betId = await makeActiveBet(database, "partial-refund");
+      const transfers = [];
+      const transferFn = async (transfer) => {
+        transfers.push(transfer);
+        if (transfers.length === 1) return "refund-one-hash";
+        throw Object.assign(new Error("second refund rejected"), {
+          beforeBroadcast: true,
+          code: "PRE_BROADCAST",
+        });
+      };
+      const refundBothFn = (...args) => refundBoth(...args.slice(0, 3), {
+        ...args[3],
+        transferFn,
+      });
+
+      const refunded = await refundBetWithClaim(
+        await database.bets.getById(betId),
+        [BET_STATUS.active],
+        { refundBothFn },
+      );
+      assert.equal(refunded, null);
+      assert.equal((await database.bets.getById(betId)).status, BET_STATUS.settlement_uncertain);
+      assert.equal(transfers.length, 2);
+      assert.deepEqual(
+        (await database.settlements.getTransferReceipts(betId)).map((receipt) => [receipt.transfer_key, receipt.tx_hash]),
+        [["refund:creator", "refund-one-hash"]],
+      );
+
+      await closeDatabase();
+      const reopened = await initializeDatabase({ backend: "legacy", legacyPath });
+      assert.deepEqual(
+        (await reopened.settlements.getTransferReceipts(betId)).map((receipt) => [receipt.transfer_key, receipt.tx_hash]),
+        [["refund:creator", "refund-one-hash"]],
+      );
+      const retried = await refundBetWithClaim(
+        await reopened.bets.getById(betId),
+        [BET_STATUS.active],
+        { refundBothFn },
+      );
+      assert.equal(retried, null);
+      assert.equal(transfers.length, 2, "an uncertain refund must not resend the first transfer");
+    });
+  } finally {
+    if (previousToken === undefined) delete process.env.TELEGRAM_TOKEN;
+    else process.env.TELEGRAM_TOKEN = previousToken;
+  }
+});
+
+test("complete payouts persist one receipt for every transfer before finalization", async () => {
+  await withDatabase(async (database) => {
+    const betId = await makeActiveBet(database, "complete-payout");
+    const claim = await database.bets.claimSettlement(betId, {
+      eligibleStatuses: [BET_STATUS.active],
+      kind: "complete_payout",
+      winnerId: 50,
+    });
+    assert.equal(claim.claimed, true);
+    const transfers = [];
+    const result = await payout({
+      betId,
+      winnerAddress: "EQcreator-refund-wallet",
+      potTon: 2,
+      oracleUsed: true,
+      arbiterAddresses: ["EQarbiter-one-wallet", "EQarbiter-two-wallet"],
+      transferFn: async (transfer) => {
+        transfers.push(transfer);
+        return `complete-hash-${transfers.length}`;
+      },
+    });
+    const receipts = await database.settlements.getTransferReceipts(betId);
+    assert.equal(receipts.length, transfers.length);
+    assert.equal(new Set(receipts.map((receipt) => receipt.transfer_key)).size, receipts.length);
+    assert.ok(receipts.some((receipt) => receipt.transfer_key === "winner" && receipt.tx_hash === result.winnerTxHash));
+    assert.equal((await database.bets.finalizeClaimedSettlement(betId, { winnerId: 50, txHash: result.winnerTxHash })).finalized, true);
+    assert.equal((await database.bets.finalizeClaimedSettlement(betId, { winnerId: 50, txHash: "second-finalization" })).finalized, false);
+    assert.equal((await database.settlements.getTransferReceipts(betId)).length, transfers.length);
   });
 });
 
@@ -261,7 +423,7 @@ test("database close is shared and supports clean reinitialization", async () =>
   }
 });
 
-test("oracle retries are cleared during shutdown before they can call the database", async () => {
+test("oracle retry stop prevents future callbacks and catches callback rejections", async () => {
   await withDatabase(async (database) => {
     const callbacks = [];
     const cleared = new Set();
@@ -275,7 +437,7 @@ test("oracle retries are cleared during shutdown before they can call the databa
     enableOracleRetryTimers();
     scheduleOracleRetry(999, botSpy());
     assert.equal(getOracleRetryTimerCount(), 1);
-    stopOracleRetryTimers();
+    await stopOracleRetryTimers();
     assert.equal(getOracleRetryTimerCount(), 0);
     await callbacks[0]();
     await new Promise((resolve) => setImmediate(resolve));
@@ -299,10 +461,81 @@ test("oracle retries are cleared during shutdown before they can call the databa
       assert.equal(unhandled, null);
     } finally {
       process.removeListener("unhandledRejection", captureUnhandled);
-      stopOracleRetryTimers();
+      await stopOracleRetryTimers();
     }
     configureOracleRetryTimersForTest();
   });
+});
+
+test("server shutdown drains an in-flight oracle retry before database close and supports a clean retry restart", async () => {
+  await closeDatabase();
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ton-consensus-retry-shutdown-"));
+  const legacyPath = path.join(directory, "retry.db");
+  const reservation = http.createServer();
+  await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+  const callbacks = [];
+  let runtime;
+  try {
+    configureOracleRetryTimersForTest({
+      setIntervalFn: (callback) => { callbacks.push(callback); return { callback }; },
+      clearIntervalFn: () => {},
+    });
+    runtime = await startServer({
+      env: { NETWORK: "testnet", TELEGRAM_DISABLED: "1", PORT: String(port), DATABASE_BACKEND: "legacy", DATABASE_PATH: legacyPath },
+      botInstance: { stop() {} },
+      registerProcessHandlers: false,
+    });
+    const database = getDatabase();
+    const originalGetById = database.bets.getById;
+    let releaseRead;
+    const readReleased = new Promise((resolve) => { releaseRead = resolve; });
+    let signalReadStarted;
+    const readStarted = new Promise((resolve) => { signalReadStarted = resolve; });
+    let reads = 0;
+    database.bets.getById = async (...args) => {
+      reads += 1;
+      signalReadStarted();
+      await readReleased;
+      return originalGetById(...args);
+    };
+    const originalClose = database.close;
+    let activeRetriesAtClose = null;
+    database.close = async () => {
+      activeRetriesAtClose = getActiveOracleRetryCount();
+      await originalClose();
+    };
+
+    scheduleOracleRetry(999, botSpy());
+    callbacks[0]();
+    await readStarted;
+    assert.equal(getActiveOracleRetryCount(), 1);
+    let shutdownFinished = false;
+    const shutdown = runtime.shutdown().then(() => { shutdownFinished = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(shutdownFinished, false, "shutdown must wait for the active retry");
+    assert.equal(getActiveOracleRetryCount(), 1);
+
+    releaseRead();
+    await shutdown;
+    assert.equal(reads, 1, "the retry must not perform another repository call after stop");
+    assert.equal(activeRetriesAtClose, 0, "database close must happen after retry work drains");
+    assert.equal(getActiveOracleRetryCount(), 0);
+
+    await Promise.all([stopOracleRetryTimers(), stopOracleRetryTimers()]);
+    enableOracleRetryTimers();
+    scheduleOracleRetry(1000, botSpy());
+    assert.equal(getOracleRetryTimerCount(), 1, "restart should accept new scheduling after drain");
+    await stopOracleRetryTimers();
+    assert.equal(getOracleRetryTimerCount(), 0);
+  } finally {
+    await runtime?.shutdown();
+    await stopOracleRetryTimers();
+    configureOracleRetryTimersForTest();
+    await closeDatabase();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("server uses injected legacy database configuration and readiness tracks initialized state", async () => {

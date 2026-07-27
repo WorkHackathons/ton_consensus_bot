@@ -147,7 +147,7 @@ async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
     return { txHash: payoutResult.winnerTxHash };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+    if (!error?.partialTransfer && (error?.beforeBroadcast || error?.code === "PRE_BROADCAST")) {
       await database.bets.markSettlementFailed(claimedBet.id, message);
     } else {
       await database.bets.markSettlementUncertain(claimedBet.id, message);

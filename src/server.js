@@ -38,7 +38,7 @@ export async function startServer({ env = process.env, botInstance = bot, regist
     closing = true;
     state.markShuttingDown();
     stopBotJobs();
-    stopOracleRetryTimers();
+    await stopOracleRetryTimers();
     await telegram.stop(reason).catch(() => {});
     await new Promise((resolve) => server.close(resolve));
     await closeDatabase().catch((error) => logger.error(`[RUNTIME] database shutdown failed: ${error?.name || "Error"}`));

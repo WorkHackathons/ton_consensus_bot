@@ -135,11 +135,25 @@ function initDB() {
       FOREIGN KEY (arbiter_id) REFERENCES users(telegram_id)
     );
 
+    CREATE TABLE IF NOT EXISTS settlement_transfer_receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bet_id INTEGER NOT NULL,
+      settlement_kind TEXT NOT NULL,
+      transfer_key TEXT NOT NULL,
+      recipient_role TEXT NOT NULL,
+      amount_ton REAL NOT NULL,
+      tx_hash TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      UNIQUE(bet_id, transfer_key),
+      FOREIGN KEY (bet_id) REFERENCES bets(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_bets_creator_id ON bets(creator_id);
     CREATE INDEX IF NOT EXISTS idx_bets_opponent_id ON bets(opponent_id);
     CREATE INDEX IF NOT EXISTS idx_bets_status_deadline ON bets(status, deadline);
     CREATE INDEX IF NOT EXISTS idx_oracle_votes_bet_id ON oracle_votes(bet_id);
     CREATE INDEX IF NOT EXISTS idx_oracle_assignments_bet_id ON oracle_assignments(bet_id);
+    CREATE INDEX IF NOT EXISTS idx_settlement_transfer_receipts_bet_id ON settlement_transfer_receipts(bet_id);
   `);
   ensureColumn("users", "arbiter_since", "INTEGER DEFAULT NULL");
   ensureColumn("users", "is_premium_arbiter", "INTEGER NOT NULL DEFAULT 0");
@@ -774,6 +788,89 @@ function markSettlementUncertain(betId, error) {
   return markSettlementState(betId, BET_STATUS.settlement_uncertain, error);
 }
 
+function settlementReceiptError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function getTransferReceipts(betId) {
+  return all(`
+    SELECT id, bet_id, settlement_kind, transfer_key, recipient_role, amount_ton, tx_hash, recorded_at
+    FROM settlement_transfer_receipts
+    WHERE bet_id = ?
+    ORDER BY id ASC
+  `, [betId]);
+}
+
+function recordTransferReceipt(betId, {
+  settlementKind,
+  transferKey,
+  recipientRole,
+  amountTon,
+  txHash,
+} = {}) {
+  const normalizedBetId = Number(betId);
+  const normalizedAmount = Number(amountTon);
+  const normalizedHash = typeof txHash === "string" ? txHash.trim() : "";
+  if (!Number.isInteger(normalizedBetId) || normalizedBetId <= 0) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_INVALID", "Settlement receipt requires a valid bet id");
+  }
+  if (typeof transferKey !== "string" || !transferKey.trim()) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_INVALID", "Settlement receipt requires a transfer key");
+  }
+  if (typeof recipientRole !== "string" || !recipientRole.trim()) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_INVALID", "Settlement receipt requires a recipient role");
+  }
+  if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_INVALID", "Settlement receipt requires a positive amount");
+  }
+  if (!normalizedHash) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_INVALID", "Settlement receipt requires a transaction hash");
+  }
+
+  const key = transferKey.trim();
+  const existing = get(`
+    SELECT id, bet_id, settlement_kind, transfer_key, recipient_role, amount_ton, tx_hash, recorded_at
+    FROM settlement_transfer_receipts
+    WHERE bet_id = ? AND transfer_key = ?
+  `, [normalizedBetId, key]);
+  if (existing) {
+    if (existing.tx_hash !== normalizedHash) {
+      throw settlementReceiptError("SETTLEMENT_RECEIPT_CONFLICT", "Settlement transfer receipt hash cannot be overwritten");
+    }
+    return { recorded: false, receipt: existing };
+  }
+
+  const bet = getBet(normalizedBetId);
+  if (!bet || bet.status !== BET_STATUS.settling || !bet.settlement_kind) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_NOT_CLAIMED", "Settlement receipts can only be recorded for a claimed settlement");
+  }
+  if (settlementKind !== bet.settlement_kind) {
+    throw settlementReceiptError("SETTLEMENT_RECEIPT_KIND_MISMATCH", "Settlement receipt kind does not match the claimed settlement");
+  }
+
+  db.run("BEGIN");
+  try {
+    run(`
+      INSERT INTO settlement_transfer_receipts
+        (bet_id, settlement_kind, transfer_key, recipient_role, amount_ton, tx_hash, recorded_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [normalizedBetId, settlementKind, key, recipientRole.trim(), normalizedAmount, normalizedHash, now()]);
+    const receipt = get(`
+      SELECT id, bet_id, settlement_kind, transfer_key, recipient_role, amount_ton, tx_hash, recorded_at
+      FROM settlement_transfer_receipts
+      WHERE bet_id = ? AND transfer_key = ?
+    `, [normalizedBetId, key]);
+    db.run("COMMIT");
+    saveDB();
+    return { recorded: true, receipt };
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
+  }
+}
+
 function refundBet(betId) {
   write(`
     UPDATE bets
@@ -895,6 +992,7 @@ function close() {
     areBothDeposited, activateBet, submitOutcome, resolveOutcomes, startOracle,
     finalizeBet, refundBet, claimSettlement, finalizeClaimedSettlement,
     markSettlementFailed, markSettlementUncertain, confirmAndMaybeActivate,
+    recordTransferReceipt, getTransferReceipts,
     assignArbiters, getAssignedArbiters, isAssignedArbiter,
     submitVote, getVotes, tallyVotes, getRecordCounts, removeBets, removeUsers,
   };

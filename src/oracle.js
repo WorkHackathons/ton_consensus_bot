@@ -8,20 +8,25 @@ import { ARBITER_COUNT, ARBITER_FEE, BET_STATUS } from "./states.js";
 import { notifyDev } from "./devNotify.js";
 
 const oracleRetryTimers = new Map();
+const activeOracleRetryPromises = new Set();
 let oracleRetriesStopped = false;
 let retryScheduler = { setInterval, clearInterval };
 const DEFAULT_ARBITER_CARD_IMAGE = "https://raw.githubusercontent.com/WorkHackathons/ton_consensus_bot/main/arbiter_verdict.png";
 
 export function enableOracleRetryTimers() {
+  if (activeOracleRetryPromises.size > 0) {
+    throw new Error("Oracle retry work must drain before timers are restarted");
+  }
   oracleRetriesStopped = false;
 }
 
-export function stopOracleRetryTimers() {
+export async function stopOracleRetryTimers() {
   oracleRetriesStopped = true;
   for (const timer of oracleRetryTimers.values()) {
     retryScheduler.clearInterval(timer);
   }
   oracleRetryTimers.clear();
+  await Promise.allSettled([...activeOracleRetryPromises]);
 }
 
 export function configureOracleRetryTimersForTest({ setIntervalFn = setInterval, clearIntervalFn = clearInterval } = {}) {
@@ -30,6 +35,10 @@ export function configureOracleRetryTimersForTest({ setIntervalFn = setInterval,
 
 export function getOracleRetryTimerCount() {
   return oracleRetryTimers.size;
+}
+
+export function getActiveOracleRetryCount() {
+  return activeOracleRetryPromises.size;
 }
 
 function escapeMarkdown(text = "") {
@@ -51,7 +60,7 @@ export async function safeNotify(bot, userId, text) {
 }
 
 function isDefinitelyPreBroadcast(error) {
-  return Boolean(error?.beforeBroadcast || error?.code === "PRE_BROADCAST");
+  return !error?.partialTransfer && Boolean(error?.beforeBroadcast || error?.code === "PRE_BROADCAST");
 }
 
 async function markSettlementFailure(database, betId, error) {
@@ -158,32 +167,51 @@ export function scheduleOracleRetry(betId, bot) {
     return;
   }
 
-  const timer = retryScheduler.setInterval(() => { (async () => {
+  let timer;
+  timer = retryScheduler.setInterval(() => {
     if (oracleRetriesStopped) return;
-    const currentBet = await getDatabase().bets.getById(betId);
-    if (oracleRetriesStopped) return;
-    if (!currentBet || currentBet.status !== "oracle") {
-      retryScheduler.clearInterval(timer);
-      oracleRetryTimers.delete(betId);
-      return;
-    }
 
-    const arbiters = await notifyArbitersForBet(currentBet, bot);
-    if (arbiters >= 2) {
-      retryScheduler.clearInterval(timer);
-      oracleRetryTimers.delete(betId);
-    }
-  })().catch((error) => logger.error(`[ORACLE] retry failed for bet ${betId}: ${error?.name || "Error"}`)); }, 30 * 60 * 1000);
+    const retryPromise = Promise.resolve().then(async () => {
+      if (oracleRetriesStopped) return;
+      const currentBet = await getDatabase().bets.getById(betId);
+      if (oracleRetriesStopped) return;
+      if (!currentBet || currentBet.status !== "oracle") {
+        retryScheduler.clearInterval(timer);
+        oracleRetryTimers.delete(betId);
+        return;
+      }
+
+      const arbiters = await notifyArbitersForBet(currentBet, bot, {
+        shouldStop: () => oracleRetriesStopped,
+      });
+      if (oracleRetriesStopped) return;
+      if (arbiters >= 2) {
+        retryScheduler.clearInterval(timer);
+        oracleRetryTimers.delete(betId);
+      }
+    });
+    activeOracleRetryPromises.add(retryPromise);
+    retryPromise.then(
+      () => activeOracleRetryPromises.delete(retryPromise),
+      (error) => {
+        activeOracleRetryPromises.delete(retryPromise);
+        logger.error(`[ORACLE] retry failed for bet ${betId}: ${error?.name || "Error"}`);
+      },
+    );
+  }, 30 * 60 * 1000);
 
   oracleRetryTimers.set(betId, timer);
 }
 
-async function notifyArbitersForBet(bet, bot) {
+async function notifyArbitersForBet(bet, bot, { shouldStop = () => false } = {}) {
+  if (shouldStop()) return 0;
   const database = getDatabase();
   const insight = analyzeBetDescription(bet.description);
   const rewardAmount = Number(((Number(bet.amount_ton) * 2 * ARBITER_FEE) / ARBITER_COUNT).toFixed(9));
   const arbiterCardImage = process.env.ARBITER_CARD_IMAGE_URL || DEFAULT_ARBITER_CARD_IMAGE;
+  if (shouldStop()) return 0;
   const premiumArbiters = await database.users.getPremiumArbiters([bet.creator_id, bet.opponent_id]);
+  if (shouldStop()) return 0;
   const needed = Math.max(0, ARBITER_COUNT - premiumArbiters.length);
   const regularArbiters = needed > 0
     ? await database.users.getArbiters(
@@ -191,6 +219,7 @@ async function notifyArbitersForBet(bet, bot) {
       needed,
     )
     : [];
+  if (shouldStop()) return 0;
   const arbiters = [...premiumArbiters, ...regularArbiters];
 
   if (arbiters.length < 2) {
@@ -217,13 +246,17 @@ async function notifyArbitersForBet(bet, bot) {
     [Markup.button.callback("✅ Player B is right", `vote:${bet.id}:${bet.opponent_id}`)],
   ]);
 
+  if (shouldStop()) return 0;
   await database.oracle.assign(bet.id, arbiters.map((arbiter) => arbiter.telegram_id));
 
   for (const arbiter of arbiters) {
+    if (shouldStop()) return 0;
     const aiNote = `🤖 *AI Note:* Objective evidence was not strong enough for automatic resolution.\nThis dispute requires human judgment.\n\n`;
+    if (shouldStop()) return 0;
     const premiumNote = await database.users.isPremiumArbiter(arbiter.telegram_id)
       ? "⭐️ *Premium Arbiter:* priority access enabled.\n\n"
       : "";
+    if (shouldStop()) return 0;
     const body =
       `⚖️ *DISPUTE #${bet.id} - YOUR VOTE IS NEEDED*\n\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
@@ -365,7 +398,10 @@ export async function handleOracleRefund(bet, bot, reason) {
 
   if (address1 && address2 && claimedBet.creator_deposit && claimedBet.opponent_deposit) {
     try {
-      await refundBoth(address1, address2, claimedBet.amount_ton);
+      await refundBoth(address1, address2, claimedBet.amount_ton, {
+        betId: claimedBet.id,
+        recipientRoles: ["creator", "opponent"],
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await markSettlementFailure(database, claimedBet.id, error);
