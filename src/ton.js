@@ -11,7 +11,7 @@ import {
   WalletContractV5R1,
 } from "@ton/ton";
 import { logger, redactWalletAddress } from "./logger.js";
-import { getBet, getReferrer, getTonAddress, incrementReferralEarnings } from "./db.js";
+import { getDatabase } from "./db/index.js";
 import {
   AI_WINNER_GETS,
   ARBITER_FEE,
@@ -729,8 +729,9 @@ export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddress
     const winnerRatio = oracleUsed ? WINNER_GETS : AI_WINNER_GETS;
     const winnerAmount = Number((totalPot * winnerRatio).toFixed(9));
     const platformBaseAmount = Number((totalPot * PLATFORM_FEE).toFixed(9));
-    const bet = betId ? getBet(betId) : null;
-    const referrer = bet ? (getReferrer(bet.creator_id) || getReferrer(bet.opponent_id)) : null;
+    const database = getDatabase();
+    const bet = betId ? await database.bets.getById(betId) : null;
+    const referrer = bet ? (await database.referrals.get(bet.creator_id) || await database.referrals.get(bet.opponent_id)) : null;
     const referralAmount = referrer ? Number((platformBaseAmount * REFERRAL_FEE).toFixed(9)) : 0;
     const platformAmount = Number(Math.max(platformBaseAmount - referralAmount, 0).toFixed(9));
     const arbiterPool = oracleUsed ? Number((totalPot * ARBITER_FEE).toFixed(9)) : 0;
@@ -753,14 +754,14 @@ export async function payout({ winnerAddress, potTon, oracleUsed, arbiterAddress
 
     let referralTxHash = null;
     if (referrer && referralAmount > 0.005) {
-      const referrerAddress = getTonAddress(referrer);
+      const referrerAddress = await database.users.getTonAddress(referrer);
       if (referrerAddress) {
         referralTxHash = await sendTonViaBestMethod({
           toAddress: referrerAddress,
           amountTon: referralAmount,
           comment: "TON Consensus referral reward",
         });
-        incrementReferralEarnings(referrer, referralAmount);
+        await database.referrals.incrementEarnings(referrer, referralAmount);
       }
     }
 
@@ -832,8 +833,9 @@ export async function executePayout(betId, winnerAddress, potTon) {
   const totalPot = Number(potTon);
   const winnerAmount = Number((totalPot * AI_WINNER_GETS).toFixed(9));
   const feeBaseAmount = Number((totalPot * PLATFORM_FEE).toFixed(9));
-  const bet = getBet(betId);
-  const referrer = bet ? (getReferrer(bet.creator_id) || getReferrer(bet.opponent_id)) : null;
+  const database = getDatabase();
+  const bet = await database.bets.getById(betId);
+  const referrer = bet ? (await database.referrals.get(bet.creator_id) || await database.referrals.get(bet.opponent_id)) : null;
   let referralTx = null;
   let referralAmount = referrer ? Number((feeBaseAmount * REFERRAL_FEE).toFixed(9)) : 0;
   const feeAmount = Number(Math.max(feeBaseAmount - referralAmount, 0).toFixed(9));
@@ -867,7 +869,7 @@ export async function executePayout(betId, winnerAddress, potTon) {
   }
 
   if (referrer) {
-    const referrerAddress = getTonAddress(referrer);
+    const referrerAddress = await database.users.getTonAddress(referrer);
     if (referrerAddress && referralAmount > 0.005) {
       try {
         referralTx = await sendTonViaBestMethod({
@@ -875,7 +877,7 @@ export async function executePayout(betId, winnerAddress, potTon) {
           amountTon: referralAmount,
           comment: "TON Consensus referral reward",
         });
-        incrementReferralEarnings(referrer, referralAmount);
+        await database.referrals.incrementEarnings(referrer, referralAmount);
         logger.info(`[REFERRAL] Paid ${referralAmount} TON to referrer ${referrer}`);
       } catch (error) {
         logger.error(`[REFERRAL] Payout failed: ${error.message}`);

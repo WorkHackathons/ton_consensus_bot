@@ -2,25 +2,7 @@ import express from "express";
 import crypto from "node:crypto";
 import { Address } from "@ton/ton";
 import { z } from "zod";
-import {
-  activateBet,
-  areBothDeposited,
-  confirmDeposit,
-  createBet,
-  finalizeBet,
-  getBet,
-  getBetsByUser,
-  getUser,
-  hideBetForUser,
-  getTonAddress,
-  getVotes,
-  joinBet,
-  resolveOutcomes,
-  saveTonAddress,
-  submitOutcome,
-  upsertUser,
-} from "./db.js";
-import db from "./db.js";
+import { getDatabase } from "./db/index.js";
 import { handleArbiterVote, safeNotify, startOracleForBet } from "./oracle.js";
 import { BET_STATUS, OUTCOME } from "./states.js";
 import { getAddressBalance, getWalletAddress, payout, verifyDeposit } from "./ton.js";
@@ -115,12 +97,13 @@ const OutcomeSchema = z.object({
 
 async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
   logger.info(`Starting payoutForBet for bet_id: ${bet.id}`);
-  const winnerAddress = getTonAddress(winnerId);
+  const database = getDatabase();
+  const winnerAddress = await database.users.getTonAddress(winnerId);
   const loserId = Number(winnerId) === Number(bet.creator_id) ? bet.opponent_id : bet.creator_id;
 
   if (!winnerAddress) {
     logger.warn(`payoutForBet missing winner address for bet_id: ${bet.id}`);
-    finalizeBet(bet.id, winnerId, "pending_address");
+    await database.bets.finalize(bet.id, winnerId, "pending_address");
     await safeNotify(bot, winnerId, `You won bet #${bet.id}, but your TON address is missing in the Mini App.`);
     await safeNotify(bot, loserId, `Bet #${bet.id} finished. Winner payout is waiting for a wallet address.`);
     logger.info(`payoutForBet completed successfully: pending_address`);
@@ -136,7 +119,7 @@ async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
       arbiterAddresses: [],
     });
 
-    finalizeBet(bet.id, winnerId, payoutResult.winnerTxHash);
+    await database.bets.finalize(bet.id, winnerId, payoutResult.winnerTxHash);
 
     await safeNotify(
       bot,
@@ -157,6 +140,7 @@ async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
 export default function createApiRouter(bot) {
   const router = express.Router();
   const TONSCAN = process.env.NETWORK === "mainnet" ? "https://tonscan.org" : "https://testnet.tonscan.org";
+  const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
   router.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
@@ -168,15 +152,13 @@ export default function createApiRouter(bot) {
     return next();
   });
 
-  router.get("/bets", (req, res) => {
+  router.get("/bets", asyncRoute(async (req, res) => {
     const status = req.query.status || "pending";
-    const bets = db.prepare(
-      "SELECT * FROM bets WHERE status = ? ORDER BY created_at DESC LIMIT 20",
-    ).all(status);
+    const bets = await getDatabase().bets.getByStatus(status, 20);
     res.json(bets);
-  });
+  }));
 
-  router.get("/bets/user/:id", (req, res) => {
+  router.get("/bets/user/:id", asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -188,33 +170,34 @@ export default function createApiRouter(bot) {
       return res.status(403).json({ error: "You can only access your own bets" });
     }
 
-    return res.json(getBetsByUser(actualId));
-  });
+    return res.json(await getDatabase().bets.getByUser(actualId));
+  }));
 
-  router.get("/bet/:id", (req, res) => {
-    const bet = getBet(parseInt(req.params.id, 10));
+  router.get("/bet/:id", asyncRoute(async (req, res) => {
+    const database = getDatabase();
+    const bet = await database.bets.getById(parseInt(req.params.id, 10));
     if (!bet) {
       return res.status(404).json({ error: "Not found" });
     }
-    const votes = getVotes(Number(req.params.id));
+    const votes = await database.oracle.getVotes(Number(req.params.id));
     return res.json({
       ...bet,
       oracle_votes_count: votes.length,
       oracle_votes_needed: 2,
       oracle_votes: votes,
     });
-  });
+  }));
 
-  router.get("/platform-wallet", async (_req, res) => {
+  router.get("/platform-wallet", asyncRoute(async (_req, res) => {
     try {
       const address = await getWalletAddress();
       return res.json({ address });
     } catch (error) {
       return res.status(500).json({ error: error.message || "Failed to load platform wallet" });
     }
-  });
+  }));
 
-  router.get("/wallet-balance", async (req, res) => {
+  router.get("/wallet-balance", asyncRoute(async (req, res) => {
     const address = String(req.query.address || "");
     if (!address) {
       return res.status(400).json({ error: "Wallet address is required" });
@@ -226,13 +209,14 @@ export default function createApiRouter(bot) {
     } catch (error) {
       return res.status(500).json({ error: error.message || "Failed to load wallet balance" });
     }
-  });
+  }));
 
-  router.get("/me", (req, res) => {
+  router.get("/me", asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) return;
-    upsertUser(Number(telegramUser.id), telegramUser.username ?? null);
-    const user = getUser(Number(telegramUser.id));
+    const database = getDatabase();
+    await database.users.upsert(Number(telegramUser.id), telegramUser.username ?? null);
+    const user = await database.users.getByTelegramId(Number(telegramUser.id));
     res.json({
       telegram_id: Number(telegramUser.id),
       username: telegramUser.username || user?.username || null,
@@ -241,9 +225,9 @@ export default function createApiRouter(bot) {
       referral_earnings: Number(user?.referral_earnings ?? 0),
       ton_address: user?.ton_address ?? null,
     });
-  });
+  }));
 
-  router.post("/bets", express.json(), (req, res) => {
+  router.post("/bets", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -273,13 +257,14 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: result.error.errors[0].message });
     }
 
-    upsertUser(result.data.creator_id, result.data.username ?? null);
-    const betId = createBet(result.data.creator_id, result.data.description, result.data.amount_ton, deadlineTs);
-    const bet = getBet(betId);
+    const database = getDatabase();
+    await database.users.upsert(result.data.creator_id, result.data.username ?? null);
+    const betId = await database.bets.create(result.data.creator_id, result.data.description, result.data.amount_ton, deadlineTs);
+    const bet = await database.bets.getById(betId);
     return res.json({ ok: true, bet });
-  });
+  }));
 
-  router.post("/bets/:id/join", express.json(), async (req, res) => {
+  router.post("/bets/:id/join", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -295,7 +280,8 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: result.error.errors[0].message });
     }
 
-    const bet = getBet(betId);
+    const database = getDatabase();
+    const bet = await database.bets.getById(betId);
     const now = Math.floor(Date.now() / 1000);
     if (!bet) {
       return res.status(404).json({ error: "Bet not found" });
@@ -313,10 +299,10 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: "You cannot join your own bet" });
     }
 
-    upsertUser(result.data.opponent_id, result.data.username ?? null);
-    joinBet(betId, result.data.opponent_id);
-    const joinedBet = getBet(betId);
-    const opponentUser = getUser(result.data.opponent_id);
+    await database.users.upsert(result.data.opponent_id, result.data.username ?? null);
+    await database.bets.join(betId, result.data.opponent_id);
+    const joinedBet = await database.bets.getById(betId);
+    const opponentUser = await database.users.getByTelegramId(result.data.opponent_id);
     const opponentLabel = opponentUser?.username ? `@${opponentUser.username}` : "Your opponent";
     await safeNotify(
       bot,
@@ -324,9 +310,9 @@ export default function createApiRouter(bot) {
       `⚡ Your challenge was accepted.\n\n${opponentLabel} is now inside the Mini App and waiting for you to complete the deposit step.`, 
     );
     return res.json({ ok: true, bet: joinedBet });
-  });
+  }));
 
-  router.post("/bets/:id/deposit", express.json(), async (req, res) => {
+  router.post("/bets/:id/deposit", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -342,7 +328,8 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: result.error.errors[0].message });
     }
 
-    const bet = getBet(betId);
+    const database = getDatabase();
+    const bet = await database.bets.getById(betId);
     const now = Math.floor(Date.now() / 1000);
     if (!bet) {
       return res.status(404).json({ error: "Bet not found" });
@@ -363,7 +350,7 @@ export default function createApiRouter(bot) {
       return res.status(403).json({ error: "You are not a participant in this bet" });
     }
 
-    const savedAddress = normalizeTonAddress(getTonAddress(result.data.telegram_id));
+    const savedAddress = normalizeTonAddress(await database.users.getTonAddress(result.data.telegram_id));
     const requestedAddress = normalizeTonAddress(result.data.userWalletAddress);
     const candidateAddresses = Array.from(new Set([requestedAddress, savedAddress].filter(Boolean)));
 
@@ -372,7 +359,7 @@ export default function createApiRouter(bot) {
     }
 
     if (!savedAddress && requestedAddress) {
-      saveTonAddress(result.data.telegram_id, requestedAddress);
+      await database.users.saveTonAddress(result.data.telegram_id, requestedAddress);
     }
 
     let verifiedTxHash = null;
@@ -397,18 +384,17 @@ export default function createApiRouter(bot) {
     }
 
     if (matchedAddress && matchedAddress !== savedAddress) {
-      saveTonAddress(result.data.telegram_id, matchedAddress);
+      await database.users.saveTonAddress(result.data.telegram_id, matchedAddress);
+    }
+    await database.deposits.confirm(betId, role);
+    if (await database.deposits.areBothConfirmed(betId)) {
+      await database.bets.activate(betId);
     }
 
-    confirmDeposit(betId, role);
-    if (areBothDeposited(betId)) {
-      activateBet(betId);
-    }
+    return res.json({ ok: true, role, txHash: verifiedTxHash, bet: await database.bets.getById(betId) });
+  }));
 
-    return res.json({ ok: true, role, txHash: verifiedTxHash, bet: getBet(betId) });
-  });
-
-  router.post("/bets/:id/outcome", express.json(), async (req, res) => {
+  router.post("/bets/:id/outcome", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -423,7 +409,8 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: result.error.errors[0].message });
     }
 
-    const bet = getBet(betId);
+    const database = getDatabase();
+    const bet = await database.bets.getById(betId);
     if (!bet) {
       return res.status(404).json({ error: "Bet not found" });
     }
@@ -443,9 +430,9 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: "Outcome already submitted" });
     }
 
-    submitOutcome(betId, result.data.telegram_id, result.data.outcome);
-    const updatedBet = getBet(betId);
-    const resolution = resolveOutcomes(betId);
+    await database.outcomes.submit(betId, result.data.telegram_id, result.data.outcome);
+    const updatedBet = await database.bets.getById(betId);
+    const resolution = await database.outcomes.resolve(betId);
 
     if (!resolution || !updatedBet) {
       return res.json({ ok: true, stage: "waiting", bet: updatedBet });
@@ -453,7 +440,7 @@ export default function createApiRouter(bot) {
 
     if (resolution === "dispute") {
       const oracleResult = await startOracleForBet(updatedBet, bot);
-      const freshBet = getBet(betId);
+      const freshBet = await database.bets.getById(betId);
       if (oracleResult === -1) {
         return res.json({
           ok: true,
@@ -478,10 +465,10 @@ export default function createApiRouter(bot) {
       });
 
       if (payoutResult.txHash === false) {
-        return res.status(500).json({ error: "Payout failed", stage: "payout_failed", bet: getBet(betId) });
+        return res.status(500).json({ error: "Payout failed", stage: "payout_failed", bet: await database.bets.getById(betId) });
       }
 
-      return res.json({ ok: true, stage: "settled", txHash: payoutResult.txHash, bet: getBet(betId) });
+      return res.json({ ok: true, stage: "settled", txHash: payoutResult.txHash, bet: await database.bets.getById(betId) });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Payout failed";
       logger.error(`Outcome settlement failed for bet_id: ${betId}, reason: ${message}`);
@@ -490,11 +477,11 @@ export default function createApiRouter(bot) {
       if (updatedBet.opponent_id) {
         await safeNotify(bot, updatedBet.opponent_id, `Bet #${betId} was resolved, but payout could not be sent yet.\n${message}`);
       }
-      return res.status(500).json({ error: message, stage: "payout_failed", bet: getBet(betId) });
+      return res.status(500).json({ error: message, stage: "payout_failed", bet: await database.bets.getById(betId) });
     }
-  });
+  }));
 
-  router.post("/bets/:id/hide", express.json(), (req, res) => {
+  router.post("/bets/:id/hide", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -505,15 +492,15 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: "Invalid bet id" });
     }
 
-    const result = hideBetForUser(betId, Number(telegramUser.id));
+    const result = await getDatabase().bets.hideForUser(betId, Number(telegramUser.id));
     if (!result.ok) {
       return res.status(400).json({ error: result.error || "Failed to remove bet" });
     }
 
     return res.json({ ok: true, betId });
-  });
+  }));
 
-  router.post("/bets/:id/vote", express.json(), async (req, res) => {
+  router.post("/bets/:id/vote", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -530,10 +517,10 @@ export default function createApiRouter(bot) {
     if (result.error) {
       return res.status(403).json({ error: result.error });
     }
-    return res.json({ ok: true, ...result, bet: getBet(betId) });
-  });
+    return res.json({ ok: true, ...result, bet: await getDatabase().bets.getById(betId) });
+  }));
 
-  router.post("/user/address", express.json(), (req, res) => {
+  router.post("/user/address", express.json(), asyncRoute(async (req, res) => {
     const telegramUser = requireTelegramUser(req, res);
     if (!telegramUser) {
       return;
@@ -547,9 +534,15 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: result.error.errors[0].message });
     }
 
-    upsertUser(result.data.telegram_id, null);
-    saveTonAddress(result.data.telegram_id, normalizeTonAddress(result.data.address));
+    const database = getDatabase();
+    await database.users.upsert(result.data.telegram_id, null);
+    await database.users.saveTonAddress(result.data.telegram_id, normalizeTonAddress(result.data.address));
     return res.json({ ok: true });
+  }));
+
+  router.use((error, _req, res, _next) => {
+    logger.error(`[API] database or handler failure: ${error?.name || "Error"}`);
+    if (!res.headersSent) res.status(500).json({ error: "Request failed" });
   });
 
   return router;

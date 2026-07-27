@@ -1,26 +1,5 @@
 import { Markup, Telegraf } from "telegraf";
-import {
-  activateBet,
-  areBothDeposited,
-  becomeArbiter,
-  confirmDeposit,
-  finalizeBet,
-  getBet,
-  getExpiredBets,
-  getArbiterAccuracy,
-  getUser,
-  getLatestUserBet,
-  getTonAddress,
-  initDB,
-  refundBet,
-  resolveOutcomes,
-  saveTonAddress,
-  setPremiumArbiter,
-  setReferrer,
-  submitOutcome,
-  upsertUser,
-} from "./db.js";
-import db from "./db.js";
+import { getDatabase } from "./db/index.js";
 import { logger } from "./logger.js";
 import { handleArbiterVote, handleOracleRefund, safeNotify, startOracleForBet } from "./oracle.js";
 import { BET_STATUS, OUTCOME } from "./states.js";
@@ -34,6 +13,7 @@ const TONSCAN = process.env.NETWORK === "mainnet" ? "https://tonscan.org" : "htt
 const ARBITER_INVITE_IMAGE = "https://github.com/WorkHackathons/ton_consensus_bot/blob/main/photo_2026-03-20_23-19-26.jpg?raw=true";
 const BET_SHARE_IMAGE = "https://raw.githubusercontent.com/WorkHackathons/ton_consensus_bot/main/photo_2026-03-20_18-21-48.jpg";
 const arbiterInviteTimers = new Map();
+const database = () => getDatabase();
 
 function escapeMarkdown(text = "") {
   return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
@@ -59,19 +39,17 @@ function buildAppUrl(path = "") {
   }
 }
 
-initDB();
-
 const premiumIds = process.env.PREMIUM_ARBITERS
   ? process.env.PREMIUM_ARBITERS.split(",").map((id) => Number.parseInt(id.trim(), 10)).filter(Number.isInteger)
   : [];
 
-for (const id of premiumIds) {
-  try {
-    upsertUser(id, null);
-    setPremiumArbiter(id, 1);
-    becomeArbiter(id);
-  } catch {
+export async function initializePremiumArbiters() {
+  for (const id of premiumIds) {
+    await database().users.upsert(id, null);
+    await database().users.setPremiumArbiter(id, 1);
+    await database().users.becomeArbiter(id);
   }
+  logger.info(`[PREMIUM] ${premiumIds.length} premium arbiters initialized`);
 }
 
 function canAccessBetShareCard(bet, telegramId) {
@@ -111,11 +89,9 @@ async function sendBetShareCard(chatId, bet) {
   );
 }
 
-logger.info(`[PREMIUM] ${premiumIds.length} premium arbiters initialized`);
-
 async function activateBetFlow(betId) {
-  activateBet(betId);
-  const bet = getBet(betId);
+  await database().bets.activate(betId);
+  const bet = await database().bets.getById(betId);
   if (!bet) {
     return;
   }
@@ -139,16 +115,16 @@ async function activateBetFlow(betId) {
 }
 
 async function handlePayoutForBet(bet, winnerId) {
-  const freshBet = getBet(bet.id);
+  const freshBet = await database().bets.getById(bet.id);
   if (!freshBet || freshBet.status === BET_STATUS.done) {
     return;
   }
 
-  const winnerAddress = getTonAddress(winnerId);
+  const winnerAddress = await database().users.getTonAddress(winnerId);
   const loserId = Number(winnerId) === Number(freshBet.creator_id) ? freshBet.opponent_id : freshBet.creator_id;
 
   if (!winnerAddress) {
-    finalizeBet(freshBet.id, winnerId, "pending_address");
+    await database().bets.finalize(freshBet.id, winnerId, "pending_address");
     await safeNotify(bot, winnerId, `You won bet #${freshBet.id}, but your TON address is missing in the Mini App.`);
     await safeNotify(bot, loserId, `Bet #${freshBet.id} finished. Winner payout is waiting for a wallet address.`);
     return;
@@ -162,7 +138,7 @@ async function handlePayoutForBet(bet, winnerId) {
     arbiterAddresses: [],
   });
 
-  finalizeBet(freshBet.id, winnerId, payoutResult.winnerTxHash);
+  await database().bets.finalize(freshBet.id, winnerId, payoutResult.winnerTxHash);
 
   await safeNotify(
     bot,
@@ -174,14 +150,14 @@ async function handlePayoutForBet(bet, winnerId) {
 
 bot.use(async (ctx, next) => {
   if (ctx.from) {
-    upsertUser(ctx.from.id, ctx.from.username || ctx.from.first_name || null);
+    await database().users.upsert(ctx.from.id, ctx.from.username || ctx.from.first_name || null);
   }
   await next();
 });
 
 bot.start(async (ctx) => {
-  const existingUser = getUser(ctx.from.id);
-  upsertUser(ctx.from.id, ctx.from.username);
+  const existingUser = await database().users.getByTelegramId(ctx.from.id);
+  await database().users.upsert(ctx.from.id, ctx.from.username);
 
   const payload = ctx.startPayload || "";
   let appUrl = buildAppUrl();
@@ -190,7 +166,7 @@ bot.start(async (ctx) => {
   if (payload.startsWith("ref_")) {
     const referrerId = Number(payload.replace("ref_", ""));
     if (referrerId && Number(referrerId) !== Number(ctx.from.id)) {
-      const wasLinked = setReferrer(ctx.from.id, referrerId);
+      const wasLinked = await database().referrals.set(ctx.from.id, referrerId);
       if (wasLinked) {
         bot.telegram.sendMessage(
           referrerId,
@@ -217,7 +193,7 @@ bot.start(async (ctx) => {
     }
   } else if (payload.startsWith("share_")) {
     const betId = Number(payload.replace("share_", ""));
-    const bet = getBet(betId);
+    const bet = await database().bets.getById(betId);
 
     if (!canAccessBetShareCard(bet, ctx.from.id)) {
       await ctx.reply("Only participants can generate a rich share card for this bet.");
@@ -236,7 +212,7 @@ bot.start(async (ctx) => {
 
   if (isJoinInvite) {
     const betId = Number(payload.replace("join_", ""));
-    const bet = getBet(betId);
+    const bet = await database().bets.getById(betId);
     const inviteCaption = bet
       ? `👊 *Challenge received*\n\n` +
         `*Bet:* ${escapeMarkdown(bet.description)}\n` +
@@ -282,7 +258,7 @@ bot.start(async (ctx) => {
     await ctx.reply(caption, keyboard);
   }
 
-  const currentStateUser = getUser(ctx.from.id);
+  const currentStateUser = await database().users.getByTelegramId(ctx.from.id);
   if (currentStateUser?.arbiter_since) {
     return;
   }
@@ -292,8 +268,8 @@ bot.start(async (ctx) => {
     clearTimeout(existingTimer);
   }
 
-  const timer = setTimeout(async () => {
-    const user = getUser(ctx.from.id);
+  const timer = setTimeout(() => { (async () => {
+    const user = await database().users.getByTelegramId(ctx.from.id);
     if (user && !user.arbiter_since && (existingUser?.bets_count ?? 0) === 0) {
       await bot.telegram.sendPhoto(
         ctx.from.id,
@@ -322,7 +298,10 @@ bot.start(async (ctx) => {
       ).catch(() => {});
     }
     arbiterInviteTimers.delete(ctx.from.id);
-  }, 30000);
+  })().catch((error) => {
+    arbiterInviteTimers.delete(ctx.from.id);
+    logger.error(`[BOT] arbiter invite timer failed: ${error?.name || "Error"}`);
+  }); }, 30000);
   arbiterInviteTimers.set(ctx.from.id, timer);
 });
 
@@ -332,7 +311,7 @@ bot.on("inline_query", async (ctx) => {
 
   if (/^bet_\d+$/i.test(query)) {
     const betId = Number(query.replace(/^bet_/i, ""));
-    const requestedBet = getBet(betId);
+    const requestedBet = await database().bets.getById(betId);
     if (
       requestedBet
       && (Number(requestedBet.creator_id) === Number(ctx.from.id) || Number(requestedBet.opponent_id) === Number(ctx.from.id))
@@ -342,7 +321,7 @@ bot.on("inline_query", async (ctx) => {
   }
 
   if (!bet) {
-    bet = getLatestUserBet(ctx.from.id);
+    bet = await database().bets.getLatestByUser(ctx.from.id);
   }
 
   if (!bet) {
@@ -412,7 +391,7 @@ bot.action("become_arbiter", async (ctx) => {
     arbiterInviteTimers.delete(ctx.from.id);
   }
 
-  const currentUser = getUser(ctx.from.id);
+  const currentUser = await database().users.getByTelegramId(ctx.from.id);
   if (currentUser?.arbiter_since) {
     await ctx.answerCbQuery("You are already an arbiter.", { show_alert: true }).catch(() => {});
     await replaceArbiterPrompt(
@@ -424,8 +403,8 @@ bot.action("become_arbiter", async (ctx) => {
   }
 
   await ctx.answerCbQuery("Checking your arbiter access...");
-  const addr = getTonAddress(ctx.from.id);
-  becomeArbiter(ctx.from.id);
+  const addr = await database().users.getTonAddress(ctx.from.id);
+  await database().users.becomeArbiter(ctx.from.id);
   await ctx.answerCbQuery("You are now an arbiter.", { show_alert: true }).catch(() => {});
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await replaceArbiterPrompt(
@@ -462,15 +441,15 @@ bot.action("share_referral", async (ctx) => {
 });
 
 bot.command("arbiter", async (ctx) => {
-  const addr = getTonAddress(ctx.from.id);
+  const addr = await database().users.getTonAddress(ctx.from.id);
 
-  const user = getUser(ctx.from.id);
+  const user = await database().users.getByTelegramId(ctx.from.id);
   if (user?.arbiter_since) {
     await ctx.reply("✅ You are already an arbiter!");
     return;
   }
 
-  becomeArbiter(ctx.from.id);
+  await database().users.becomeArbiter(ctx.from.id);
   const refLink = `https://t.me/ton_consensus_bot?start=ref_${ctx.from.id}`;
   await ctx.reply(
     `✅ *You are now an arbiter!*\n\nYou'll receive notifications when disputes need resolution.${addr ? "" : "\n\nConnect a TON wallet inside the Mini App before your first reward is paid out."}\n\n🔗 Your referral link:\n\`${refLink}\``,
@@ -479,10 +458,10 @@ bot.command("arbiter", async (ctx) => {
 });
 
 bot.command("mystats", async (ctx) => {
-  const user = getUser(ctx.from.id);
-  const accuracy = getArbiterAccuracy(ctx.from.id);
+  const user = await database().users.getByTelegramId(ctx.from.id);
+  const accuracy = await database().reporting.arbiterAccuracy(ctx.from.id);
   const isArbiter = !!user?.arbiter_since;
-  const referrals = Number(db.prepare("SELECT COUNT(*) as count FROM users WHERE referred_by = ?").get(ctx.from.id)?.count ?? 0);
+  const referrals = await database().referrals.count(ctx.from.id);
 
   await ctx.reply(
     `📊 *Your Stats*\n\n` +
@@ -507,7 +486,7 @@ bot.on("message", async (ctx, next) => {
   try {
     const data = JSON.parse(ctx.message.web_app_data.data);
     if (data.type === "saveAddress" && data.address) {
-      saveTonAddress(ctx.from.id, data.address);
+      await database().users.saveTonAddress(ctx.from.id, data.address);
       await ctx.reply("✅ Wallet connected!");
     }
   } catch {
@@ -520,7 +499,7 @@ bot.action(/^deposit:(\d+):(creator|opponent)$/, async (ctx) => {
   // Legacy handler - main deposit flow is in Mini App via API
   const betId = Number(ctx.match[1]);
   const role = ctx.match[2];
-  const bet = getBet(betId);
+  const bet = await database().bets.getById(betId);
   await ctx.answerCbQuery();
 
   if (!bet) {
@@ -539,21 +518,21 @@ bot.action(/^deposit:(\d+):(creator|opponent)$/, async (ctx) => {
     return;
   }
 
-  const participantAddress = getTonAddress(expectedUserId);
+  const participantAddress = await database().users.getTonAddress(expectedUserId);
   if (!participantAddress) {
     await ctx.reply("Connect your wallet in the Mini App first.");
     return;
   }
 
   // TODO: re-enable on-chain verification after demo
-  confirmDeposit(betId, role);
+  await database().deposits.confirm(betId, role);
 
   try {
     await ctx.editMessageReplyMarkup(undefined);
   } catch {
   }
 
-  if (areBothDeposited(betId)) {
+  if (await database().deposits.areBothConfirmed(betId)) {
     await activateBetFlow(betId);
     await ctx.reply("Deposit confirmed. Both deposits are in. The bet is now active.");
     return;
@@ -565,7 +544,7 @@ bot.action(/^deposit:(\d+):(creator|opponent)$/, async (ctx) => {
 bot.action(/^outcome:(\d+):(win|lose)$/, async (ctx) => {
   const betId = Number(ctx.match[1]);
   const outcome = ctx.match[2];
-  const bet = getBet(betId);
+  const bet = await database().bets.getById(betId);
   await ctx.answerCbQuery();
 
   if (!bet) {
@@ -591,8 +570,8 @@ bot.action(/^outcome:(\d+):(win|lose)$/, async (ctx) => {
     return;
   }
 
-  submitOutcome(betId, ctx.from.id, outcome);
-  const updatedBet = getBet(betId);
+  await database().outcomes.submit(betId, ctx.from.id, outcome);
+  const updatedBet = await database().bets.getById(betId);
 
   await ctx.reply("Your outcome was saved.");
 
@@ -600,7 +579,7 @@ bot.action(/^outcome:(\d+):(win|lose)$/, async (ctx) => {
     return;
   }
 
-  const resolution = resolveOutcomes(betId);
+  const resolution = await database().outcomes.resolve(betId);
 
   if (!resolution) {
     return;
@@ -626,7 +605,7 @@ bot.action(/^outcome:(\d+):(win|lose)$/, async (ctx) => {
 bot.action(/^vote:(\d+):(\d+)$/, async (ctx) => {
   const betId = Number(ctx.match[1]);
   const voteFor = Number(ctx.match[2]);
-  const bet = getBet(betId);
+  const bet = await database().bets.getById(betId);
   await ctx.answerCbQuery();
 
   if (!bet || bet.status !== BET_STATUS.oracle) {
@@ -653,16 +632,10 @@ let botJobsTimer = null;
 
 export function startBotJobs() {
   if (botJobsTimer) return;
-  botJobsTimer = setInterval(async () => {
+  botJobsTimer = setInterval(() => { (async () => {
   const now = Math.floor(Date.now() / 1000);
 
-  const expiredActive = db.prepare(`
-    SELECT *
-    FROM bets
-    WHERE status IN ('active', 'confirming')
-      AND deadline IS NOT NULL
-      AND deadline < ?
-  `).all(now);
+  const expiredActive = await database().bets.getExpiredActive(now);
 
   for (const bet of expiredActive) {
     try {
@@ -670,7 +643,7 @@ export function startBotJobs() {
       const hasOpponentOutcome = !!bet.opponent_outcome;
 
       if (hasCreatorOutcome && hasOpponentOutcome) {
-        const resolution = resolveOutcomes(bet.id);
+        const resolution = await database().outcomes.resolve(bet.id);
         if (resolution === "dispute") {
           await startOracleForBet(bet, bot);
         } else if (resolution) {
@@ -710,22 +683,16 @@ export function startBotJobs() {
         );
       }
     } catch (error) {
-      console.error(`Expired active bet handler failed for bet ${bet.id}:`, error.message);
+      logger.error(`[BOT] expired active bet handling failed for ${bet.id}: ${error?.name || "Error"}`);
     }
   }
 
-  const expiredPending = db.prepare(`
-    SELECT *
-    FROM bets
-    WHERE status = 'pending'
-      AND deadline IS NOT NULL
-      AND deadline < ?
-  `).all(now);
+  const expiredPending = await database().bets.getExpiredPending(now);
 
   for (const bet of expiredPending) {
     try {
-      const creatorAddress = getTonAddress(bet.creator_id);
-      const opponentAddress = getTonAddress(bet.opponent_id);
+      const creatorAddress = await database().users.getTonAddress(bet.creator_id);
+      const opponentAddress = await database().users.getTonAddress(bet.opponent_id);
       const hadCreatorDeposit = Boolean(bet.creator_deposit);
       const hadOpponentDeposit = Boolean(bet.opponent_deposit);
 
@@ -735,7 +702,7 @@ export function startBotJobs() {
         await refundSingle(creatorAddress, bet.amount_ton);
       }
 
-      refundBet(bet.id);
+      await database().bets.refund(bet.id);
       await safeNotify(
         bot,
         bet.creator_id,
@@ -753,11 +720,11 @@ export function startBotJobs() {
         );
       }
     } catch (error) {
-      console.error(`Expired pending bet handler failed for bet ${bet.id}:`, error.message);
+      logger.error(`[BOT] expired pending bet handling failed for ${bet.id}: ${error?.name || "Error"}`);
     }
   }
 
-  const expiredBets = getExpiredBets();
+  const expiredBets = await database().bets.getExpired();
 
   for (const bet of expiredBets) {
     try {
@@ -766,23 +733,23 @@ export function startBotJobs() {
         continue;
       }
 
-      const creatorAddress = getTonAddress(bet.creator_id);
-      const opponentAddress = getTonAddress(bet.opponent_id);
+      const creatorAddress = await database().users.getTonAddress(bet.creator_id);
+      const opponentAddress = await database().users.getTonAddress(bet.opponent_id);
 
       if (bet.creator_deposit && bet.opponent_deposit && creatorAddress && opponentAddress) {
         await refundBoth(creatorAddress, opponentAddress, bet.amount_ton);
       }
 
-      refundBet(bet.id);
+      await database().bets.refund(bet.id);
       await safeNotify(bot, bet.creator_id, `Bet #${bet.id} expired and was refunded.`);
       if (bet.opponent_id) {
         await safeNotify(bot, bet.opponent_id, `Bet #${bet.id} expired and was refunded.`);
       }
     } catch (error) {
-      console.error(`Expired bet handler failed for bet ${bet.id}:`, error.message);
+      logger.error(`[BOT] expired bet handling failed for ${bet.id}: ${error?.name || "Error"}`);
     }
   }
-  }, 60 * 1000);
+  })().catch((error) => logger.error(`[BOT] settlement timer failed: ${error?.name || "Error"}`)); }, 60 * 1000);
 }
 
 export function stopBotJobs() {

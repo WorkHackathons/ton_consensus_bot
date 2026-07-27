@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { getTonAddress, finalizeBet } from "./db.js";
+import { getDatabase } from "./db/index.js";
 import { executePayout } from "./ton.js";
 import { logger } from "./logger.js";
 import { notifyDev } from "./devNotify.js";
@@ -429,7 +429,8 @@ export async function runArbiterEngine(bet, bot) {
 
   const winnerId = verdict.winner_side === "creator" ? bet.creator_id : bet.opponent_id;
   const loserId = Number(winnerId) === Number(bet.creator_id) ? bet.opponent_id : bet.creator_id;
-  const winnerAddress = getTonAddress(winnerId);
+  const database = getDatabase();
+  const winnerAddress = await database.users.getTonAddress(winnerId);
 
   logger.info(`[ENGINE] Winner: ${winnerId}, paying out...`);
 
@@ -456,7 +457,7 @@ export async function runArbiterEngine(bet, bot) {
     logger.warn(`[ENGINE] Winner ${winnerId} has no wallet address, marking payout pending`);
   }
 
-  finalizeBet(bet.id, winnerId, txHash);
+  await database.bets.finalize(bet.id, winnerId, txHash);
 
   const tonscan = process.env.NETWORK === "mainnet"
     ? "https://tonscan.org"

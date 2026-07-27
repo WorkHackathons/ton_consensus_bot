@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { createApp } from "./app.js";
-import { initDB } from "./db.js";
-import bot, { startBotJobs, stopBotJobs } from "./bot.js";
+import { closeDatabase, initializeDatabase } from "./db/index.js";
+import bot, { initializePremiumArbiters, startBotJobs, stopBotJobs } from "./bot.js";
 import { parseConfig, redactConfig } from "./runtime/config.js";
 import { createRuntimeState } from "./runtime/state.js";
 import { createTelegramRuntime } from "./runtime/telegram.js";
@@ -10,8 +10,9 @@ import { logger } from "./logger.js";
 export async function startServer({ env = process.env, botInstance = bot, registerProcessHandlers = true } = {}) {
   const config = parseConfig(env, { allowDisabled: true });
   const state = createRuntimeState();
-  initDB();
+  await initializeDatabase();
   state.markDatabaseInitialized();
+  await initializePremiumArbiters();
   const webhookHandler = config.telegramMode === "webhook" ? botInstance.webhookCallback(config.webhookPath) : undefined;
   const app = createApp({ bot: botInstance, config, state, webhookHandler });
   const telegram = createTelegramRuntime({ bot: botInstance, config, state, logger });
@@ -34,6 +35,7 @@ export async function startServer({ env = process.env, botInstance = bot, regist
     stopBotJobs();
     await telegram.stop(reason).catch(() => {});
     await new Promise((resolve) => server.close(resolve));
+    await closeDatabase().catch((error) => logger.error(`[RUNTIME] database shutdown failed: ${error?.name || "Error"}`));
   };
   if (registerProcessHandlers) {
     process.once("SIGTERM", () => shutdown("SIGTERM"));

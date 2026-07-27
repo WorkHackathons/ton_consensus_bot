@@ -1,21 +1,4 @@
-import db, {
-  activateBet,
-  areBothDeposited,
-  assignArbiters,
-  confirmDeposit,
-  createBet,
-  finalizeBet,
-  getArbiterCount,
-  getCompletedBetsCount,
-  joinBet,
-  resolveOutcomes,
-  saveTonAddress,
-  startOracle,
-  submitOutcome,
-  submitVote,
-  tallyVotes,
-  upsertUser,
-} from "./db.js";
+import { getDatabase } from "./db/index.js";
 import { runArbiterEngineDryRun } from "./engine.js";
 import { getAddressBalance, getWalletAddress } from "./ton.js";
 import { logger } from "./logger.js";
@@ -53,19 +36,14 @@ async function runCheck(name, fn) {
   }
 }
 
-function cleanupSelfTestRecords({ betIds, userIds }) {
-  for (const betId of betIds) {
-    db.prepare("DELETE FROM oracle_votes WHERE bet_id = ?").run(betId);
-    db.prepare("DELETE FROM oracle_assignments WHERE bet_id = ?").run(betId);
-    db.prepare("DELETE FROM bets WHERE id = ?").run(betId);
-  }
-
-  for (const userId of userIds) {
-    db.prepare("DELETE FROM users WHERE telegram_id = ?").run(userId);
-  }
+async function cleanupSelfTestRecords({ betIds, userIds }) {
+  const database = getDatabase();
+  await database.test.removeBets(betIds);
+  await database.test.removeUsers(userIds);
 }
 
 async function simulateDisputeFlow() {
+  const database = getDatabase();
   const stamp = Date.now();
   const userA = 910000001 + (stamp % 1000);
   const userB = 910001001 + (stamp % 1000);
@@ -81,65 +59,65 @@ async function simulateDisputeFlow() {
     const depositWallet = await getWalletAddress();
 
     for (const id of userIds) {
-      upsertUser(id, `selftest_${id}`);
-      saveTonAddress(id, depositWallet);
+      await database.users.upsert(id, `selftest_${id}`);
+      await database.users.saveTonAddress(id, depositWallet);
     }
 
-    const instantBetId = createBet(
+    const instantBetId = await database.bets.create(
       userA,
       `[SELFTEST] Instant settle flow ${stamp}`,
       0.1,
       Math.floor(Date.now() / 1000) + 3600,
     );
     betIds.push(instantBetId);
-    joinBet(instantBetId, userB);
-    confirmDeposit(instantBetId, "creator");
-    confirmDeposit(instantBetId, "opponent");
-    if (!areBothDeposited(instantBetId)) {
+    await database.bets.join(instantBetId, userB);
+    await database.deposits.confirm(instantBetId, "creator");
+    await database.deposits.confirm(instantBetId, "opponent");
+    if (!await database.deposits.areBothConfirmed(instantBetId)) {
       throw new Error("Synthetic instant flow failed: deposits did not lock for both sides");
     }
-    activateBet(instantBetId);
-    submitOutcome(instantBetId, userA, OUTCOME.win);
-    submitOutcome(instantBetId, userB, OUTCOME.lose);
-    const instantWinner = resolveOutcomes(instantBetId);
+    await database.bets.activate(instantBetId);
+    await database.outcomes.submit(instantBetId, userA, OUTCOME.win);
+    await database.outcomes.submit(instantBetId, userB, OUTCOME.lose);
+    const instantWinner = await database.outcomes.resolve(instantBetId);
     if (Number(instantWinner) !== Number(userA)) {
       throw new Error(`Synthetic instant flow failed: expected winner ${userA}, got ${instantWinner}`);
     }
-    finalizeBet(instantBetId, userA, "selftest_instant");
+    await database.bets.finalize(instantBetId, userA, "selftest_instant");
 
-    const oracleBetId = createBet(
+    const oracleBetId = await database.bets.create(
       userA,
       `[SELFTEST] Oracle dispute flow ${stamp}`,
       0.1,
       Math.floor(Date.now() / 1000) + 3600,
     );
     betIds.push(oracleBetId);
-    joinBet(oracleBetId, userB);
-    confirmDeposit(oracleBetId, "creator");
-    confirmDeposit(oracleBetId, "opponent");
-    if (!areBothDeposited(oracleBetId)) {
+    await database.bets.join(oracleBetId, userB);
+    await database.deposits.confirm(oracleBetId, "creator");
+    await database.deposits.confirm(oracleBetId, "opponent");
+    if (!await database.deposits.areBothConfirmed(oracleBetId)) {
       throw new Error("Synthetic oracle flow failed: deposits did not lock for both sides");
     }
-    activateBet(oracleBetId);
-    submitOutcome(oracleBetId, userA, OUTCOME.win);
-    submitOutcome(oracleBetId, userB, OUTCOME.win);
-    const disputeResult = resolveOutcomes(oracleBetId);
+    await database.bets.activate(oracleBetId);
+    await database.outcomes.submit(oracleBetId, userA, OUTCOME.win);
+    await database.outcomes.submit(oracleBetId, userB, OUTCOME.win);
+    const disputeResult = await database.outcomes.resolve(oracleBetId);
     if (disputeResult !== "dispute") {
       throw new Error(`Synthetic oracle flow failed: expected dispute, got ${disputeResult}`);
     }
 
-    startOracle(oracleBetId);
-    assignArbiters(oracleBetId, [arbiter1, arbiter2, arbiter3]);
-    submitVote(oracleBetId, arbiter1, userA);
-    submitVote(oracleBetId, arbiter2, userA);
-    const votedWinner = tallyVotes(oracleBetId);
+    await database.bets.startOracle(oracleBetId);
+    await database.oracle.assign(oracleBetId, [arbiter1, arbiter2, arbiter3]);
+    await database.oracle.submitVote(oracleBetId, arbiter1, userA);
+    await database.oracle.submitVote(oracleBetId, arbiter2, userA);
+    const votedWinner = await database.oracle.tallyVotes(oracleBetId);
     if (Number(votedWinner) !== Number(userA)) {
       throw new Error(`Synthetic oracle flow failed: expected arbiter winner ${userA}, got ${votedWinner}`);
     }
-    finalizeBet(oracleBetId, userA, "selftest_oracle");
+    await database.bets.finalize(oracleBetId, userA, "selftest_oracle");
 
-    const instantStatus = db.prepare("SELECT status FROM bets WHERE id = ?").get(instantBetId)?.status;
-    const oracleStatus = db.prepare("SELECT status FROM bets WHERE id = ?").get(oracleBetId)?.status;
+    const instantStatus = (await database.bets.getById(instantBetId))?.status;
+    const oracleStatus = (await database.bets.getById(oracleBetId))?.status;
     if (instantStatus !== BET_STATUS.done || oracleStatus !== BET_STATUS.done) {
       throw new Error(`Synthetic flow failed: statuses are instant=${instantStatus}, oracle=${oracleStatus}`);
     }
@@ -150,11 +128,12 @@ async function simulateDisputeFlow() {
       fix: "",
     };
   } finally {
-    cleanupSelfTestRecords({ betIds, userIds });
+    await cleanupSelfTestRecords({ betIds, userIds });
   }
 }
 
 async function simulateAiAutoArbiter() {
+  const database = getDatabase();
   const stamp = Date.now();
   const creatorId = 920000001 + (stamp % 1000);
   const opponentId = 920001001 + (stamp % 1000);
@@ -166,8 +145,8 @@ async function simulateAiAutoArbiter() {
     const depositWallet = await getWalletAddress();
 
     for (const id of userIds) {
-      upsertUser(id, `selftest_ai_${id}`);
-      saveTonAddress(id, depositWallet);
+      await database.users.upsert(id, `selftest_ai_${id}`);
+      await database.users.saveTonAddress(id, depositWallet);
     }
 
     const cases = [
@@ -220,7 +199,7 @@ async function simulateAiAutoArbiter() {
       fix: "Check OPENAI_API_KEY, TAVILY_API_KEY, outbound internet, and model/tool availability if AI oracle dry-run fails.",
     };
   } finally {
-    cleanupSelfTestRecords({ betIds: [], userIds });
+    await cleanupSelfTestRecords({ betIds: [], userIds });
   }
 }
 
@@ -259,8 +238,7 @@ export async function runSelfTest(bot) {
       };
     }),
     runCheck("SQLite DB", async () => {
-      const users = Number(db.prepare("SELECT COUNT(*) as count FROM users").get()?.count ?? 0);
-      const bets = Number(db.prepare("SELECT COUNT(*) as count FROM bets").get()?.count ?? 0);
+      const { users, bets } = await getDatabase().reporting.recordCounts();
       return { details: `users=${users}, bets=${bets}` };
     }),
     runCheck("Deposit wallet derivation", async () => {
@@ -295,8 +273,8 @@ export async function runSelfTest(bot) {
       return { details: process.env.MINIAPP_URL };
     }),
     runCheck("Arbiter readiness", async () => {
-      const arbiters = getArbiterCount();
-      const completed = getCompletedBetsCount();
+      const arbiters = await getDatabase().reporting.arbiterCount();
+      const completed = await getDatabase().reporting.completedBetsCount();
       if (arbiters < 1) {
         throw new Error("no active arbiters found");
       }

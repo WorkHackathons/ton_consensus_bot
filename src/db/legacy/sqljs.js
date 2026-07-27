@@ -2,29 +2,31 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import initSqlJs from "sql.js";
-import { BET_STATUS, ORACLE_TIMEOUT_24H, TIMEOUT_48H } from "./states.js";
+import { BET_STATUS, ORACLE_TIMEOUT_24H } from "../../states.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.resolve(__dirname, "../data");
-const DB_PATH = path.resolve(DATA_DIR, "consensus.db");
+const DEFAULT_DB_PATH = path.resolve(__dirname, "../../../data/consensus.db");
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+/**
+ * The only sql.js implementation. The public adapter wraps this store in
+ * Promises so no application consumer can reach sql.js directly.
+ */
+export async function createSqlJsLegacyStore({ databasePath = process.env.DATABASE_PATH || DEFAULT_DB_PATH } = {}) {
+  const dataDir = path.dirname(databasePath);
+  const SQL = await initSqlJs({
+    locateFile: (file) => path.resolve(__dirname, "../../../node_modules/sql.js/dist", file),
+  });
+  fs.mkdirSync(dataDir, { recursive: true });
+  const db = fs.existsSync(databasePath)
+    ? new SQL.Database(new Uint8Array(fs.readFileSync(databasePath)))
+    : new SQL.Database();
+  db.run("PRAGMA foreign_keys = ON;");
 
-const SQL = await initSqlJs({
-  locateFile: (file) => path.resolve(__dirname, "../node_modules/sql.js/dist", file),
-});
-
-const db = fs.existsSync(DB_PATH)
-  ? new SQL.Database(new Uint8Array(fs.readFileSync(DB_PATH)))
-  : new SQL.Database();
-
-db.run("PRAGMA foreign_keys = ON;");
-
-const now = () => Math.floor(Date.now() / 1000);
+  const now = () => Math.floor(Date.now() / 1000);
 
 function saveDB() {
-  fs.writeFileSync(DB_PATH, db.export());
+  fs.writeFileSync(databasePath, db.export());
 }
 
 function run(sql, params = []) {
@@ -73,7 +75,7 @@ function ensureColumn(table, column, definition) {
   }
 }
 
-export function initDB() {
+function initDB() {
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
       telegram_id INTEGER PRIMARY KEY,
@@ -144,7 +146,7 @@ export function initDB() {
   saveDB();
 }
 
-export function upsertUser(telegramId, username) {
+function upsertUser(telegramId, username) {
   write(`
     INSERT INTO users (telegram_id, username, created_at)
     VALUES (?, ?, ?)
@@ -153,20 +155,20 @@ export function upsertUser(telegramId, username) {
   `, [telegramId, username ?? null, now()]);
 }
 
-export function getUser(telegramId) {
+function getUser(telegramId) {
   return get("SELECT * FROM users WHERE telegram_id = ?", [telegramId]);
 }
 
-export function saveTonAddress(telegramId, address) {
+function saveTonAddress(telegramId, address) {
   write("UPDATE users SET ton_address = ? WHERE telegram_id = ?", [address, telegramId]);
 }
 
-export function getTonAddress(telegramId) {
+function getTonAddress(telegramId) {
   const row = get("SELECT ton_address FROM users WHERE telegram_id = ?", [telegramId]);
   return row?.ton_address ?? null;
 }
 
-export function getRandomArbiters(excludeIds, count) {
+function getRandomArbiters(excludeIds, count) {
   const exclude = Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : [];
   const placeholders = exclude.map(() => "?").join(", ");
   const filter = exclude.length
@@ -182,11 +184,11 @@ export function getRandomArbiters(excludeIds, count) {
   `, [...exclude, count]);
 }
 
-export function getArbiterCount() {
+function getArbiterCount() {
   return Number(get("SELECT COUNT(*) AS count FROM users WHERE arbiter_since IS NOT NULL")?.count ?? 0);
 }
 
-export function getBootstrapArbiters(excludeIds, count) {
+function getBootstrapArbiters(excludeIds, count) {
   const exclude = Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : [];
   const placeholders = exclude.map(() => "?").join(", ");
   const whereClause = placeholders ? `WHERE telegram_id NOT IN (${placeholders})` : "";
@@ -200,7 +202,7 @@ export function getBootstrapArbiters(excludeIds, count) {
   `, [...exclude, count]);
 }
 
-export function getArbiters(excludeIds, count) {
+function getArbiters(excludeIds, count) {
   const exclude = Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : [];
   const placeholders = exclude.map(() => "?").join(", ");
   const whereClause = placeholders
@@ -222,19 +224,19 @@ export function getArbiters(excludeIds, count) {
   return arbiters;
 }
 
-export function becomeArbiter(telegramId) {
+function becomeArbiter(telegramId) {
   write("UPDATE users SET arbiter_since = ? WHERE telegram_id = ?", [now(), telegramId]);
 }
 
-export function setPremiumArbiter(telegramId, value = 1) {
+function setPremiumArbiter(telegramId, value = 1) {
   write("UPDATE users SET is_premium_arbiter = ? WHERE telegram_id = ?", [value ? 1 : 0, telegramId]);
 }
 
-export function isPremiumArbiter(telegramId) {
+function isPremiumArbiter(telegramId) {
   return Boolean(get("SELECT is_premium_arbiter FROM users WHERE telegram_id = ?", [telegramId])?.is_premium_arbiter);
 }
 
-export function getPremiumArbiters(excludeIds = []) {
+function getPremiumArbiters(excludeIds = []) {
   const exclude = Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : [];
   const placeholders = exclude.map(() => "?").join(", ");
   const whereClause = placeholders
@@ -249,11 +251,11 @@ export function getPremiumArbiters(excludeIds = []) {
   `, exclude);
 }
 
-export function getReferrer(telegramId) {
+function getReferrer(telegramId) {
   return get("SELECT referred_by FROM users WHERE telegram_id = ?", [telegramId])?.referred_by ?? null;
 }
 
-export function setReferrer(telegramId, referrerId) {
+function setReferrer(telegramId, referrerId) {
   const user = getUser(telegramId);
   if (!user || user.referred_by || Number(referrerId) === Number(telegramId)) {
     return false;
@@ -263,14 +265,14 @@ export function setReferrer(telegramId, referrerId) {
   return true;
 }
 
-export function incrementReferralEarnings(telegramId, amountTon) {
+function incrementReferralEarnings(telegramId, amountTon) {
   write(
     "UPDATE users SET referral_earnings = COALESCE(referral_earnings, 0) + ? WHERE telegram_id = ?",
     [amountTon, telegramId],
   );
 }
 
-export function getArbiterAccuracy(telegramId) {
+function getArbiterAccuracy(telegramId) {
   const votes = all(`
     SELECT ov.vote, b.winner_id
     FROM oracle_votes ov
@@ -290,7 +292,7 @@ export function getArbiterAccuracy(telegramId) {
   };
 }
 
-export function createBet(creatorId, description, amountTon, deadlineTs) {
+function createBet(creatorId, description, amountTon, deadlineTs) {
   run(`
     INSERT INTO bets (creator_id, description, amount_ton, status, created_at, deadline)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -301,11 +303,11 @@ export function createBet(creatorId, description, amountTon, deadlineTs) {
   return Number(row?.id ?? 0);
 }
 
-export function getBet(betId) {
+function getBet(betId) {
   return get("SELECT * FROM bets WHERE id = ?", [betId]);
 }
 
-export function getBetsByUser(telegramId) {
+function getBetsByUser(telegramId) {
   return all(`
     SELECT *
     FROM bets
@@ -319,7 +321,7 @@ export function getBetsByUser(telegramId) {
   `, [telegramId, telegramId]);
 }
 
-export function getLatestUserBet(telegramId) {
+function getLatestUserBet(telegramId) {
   return get(`
     SELECT *
     FROM bets
@@ -329,11 +331,11 @@ export function getLatestUserBet(telegramId) {
   `, [telegramId, telegramId]);
 }
 
-export function getCompletedBetsCount() {
+function getCompletedBetsCount() {
   return Number(get("SELECT COUNT(*) AS count FROM bets WHERE status = ?", [BET_STATUS.done])?.count ?? 0);
 }
 
-export function hideBetForUser(betId, telegramId) {
+function hideBetForUser(betId, telegramId) {
   const bet = getBet(betId);
   if (!bet) {
     return { ok: false, error: "Bet not found" };
@@ -357,7 +359,7 @@ export function hideBetForUser(betId, telegramId) {
   return { ok: false, error: "You are not a participant in this bet" };
 }
 
-export function getPendingBets() {
+function getPendingBets() {
   return all(`
     SELECT *
     FROM bets
@@ -366,7 +368,34 @@ export function getPendingBets() {
   `, [BET_STATUS.pending]);
 }
 
-export function getExpiredBets() {
+function getBetsByStatus(status, limit = 20) {
+  return all(
+    "SELECT * FROM bets WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+    [status, limit],
+  );
+}
+
+function getExpiredActiveBets(at = now()) {
+  return all(`
+    SELECT *
+    FROM bets
+    WHERE status IN (?, ?)
+      AND deadline IS NOT NULL
+      AND deadline < ?
+  `, [BET_STATUS.active, BET_STATUS.confirming, at]);
+}
+
+function getExpiredPendingBets(at = now()) {
+  return all(`
+    SELECT *
+    FROM bets
+    WHERE status = ?
+      AND deadline IS NOT NULL
+      AND deadline < ?
+  `, [BET_STATUS.pending, at]);
+}
+
+function getExpiredBets() {
   return all(`
     SELECT *
     FROM bets
@@ -380,7 +409,7 @@ export function getExpiredBets() {
   `, [BET_STATUS.oracle, now(), BET_STATUS.oracle, now(), BET_STATUS.done, BET_STATUS.refunded]);
 }
 
-export function joinBet(betId, opponentId) {
+function joinBet(betId, opponentId) {
   write(`
     UPDATE bets
     SET opponent_id = ?
@@ -390,7 +419,7 @@ export function joinBet(betId, opponentId) {
   `, [opponentId, betId, BET_STATUS.pending]);
 }
 
-export function confirmDeposit(betId, role) {
+function confirmDeposit(betId, role) {
   if (role !== "creator" && role !== "opponent") {
     throw new Error("Invalid deposit role");
   }
@@ -403,7 +432,7 @@ export function confirmDeposit(betId, role) {
   `, [betId]);
 }
 
-export function areBothDeposited(betId) {
+function areBothDeposited(betId) {
   const row = get(`
     SELECT creator_deposit, opponent_deposit
     FROM bets
@@ -413,7 +442,7 @@ export function areBothDeposited(betId) {
   return Boolean(row?.creator_deposit && row?.opponent_deposit);
 }
 
-export function activateBet(betId) {
+function activateBet(betId) {
   write(`
     UPDATE bets
     SET status = ?
@@ -421,7 +450,7 @@ export function activateBet(betId) {
   `, [BET_STATUS.active, betId]);
 }
 
-export function submitOutcome(betId, userId, outcome) {
+function submitOutcome(betId, userId, outcome) {
   const bet = getBet(betId);
   if (!bet) {
     return;
@@ -457,7 +486,7 @@ export function submitOutcome(betId, userId, outcome) {
   }
 }
 
-export function resolveOutcomes(betId) {
+function resolveOutcomes(betId) {
   const bet = getBet(betId);
   if (!bet || !bet.creator_outcome || !bet.opponent_outcome) {
     return null;
@@ -474,7 +503,7 @@ export function resolveOutcomes(betId) {
   return "dispute";
 }
 
-export function startOracle(betId) {
+function startOracle(betId) {
   write(`
     UPDATE bets
     SET status = ?,
@@ -483,7 +512,7 @@ export function startOracle(betId) {
   `, [BET_STATUS.oracle, now() + ORACLE_TIMEOUT_24H, betId]);
 }
 
-export function finalizeBet(betId, winnerId, txhash) {
+function finalizeBet(betId, winnerId, txhash) {
   const bet = getBet(betId);
   if (!bet) {
     return;
@@ -519,7 +548,7 @@ export function finalizeBet(betId, winnerId, txhash) {
   }
 }
 
-export function refundBet(betId) {
+function refundBet(betId) {
   write(`
     UPDATE bets
     SET status = ?,
@@ -529,7 +558,7 @@ export function refundBet(betId) {
   `, [BET_STATUS.refunded, betId]);
 }
 
-export function assignArbiters(betId, arbiterIds) {
+function assignArbiters(betId, arbiterIds) {
   const ids = Array.isArray(arbiterIds) ? [...new Set(arbiterIds.filter(Boolean).map(Number))] : [];
   db.run("BEGIN");
   try {
@@ -548,14 +577,14 @@ export function assignArbiters(betId, arbiterIds) {
   }
 }
 
-export function getAssignedArbiters(betId) {
+function getAssignedArbiters(betId) {
   return all(
     "SELECT arbiter_id FROM oracle_assignments WHERE bet_id = ? ORDER BY assigned_at ASC",
     [betId],
   ).map((row) => Number(row.arbiter_id));
 }
 
-export function isAssignedArbiter(betId, arbiterId) {
+function isAssignedArbiter(betId, arbiterId) {
   const row = get(
     "SELECT 1 AS ok FROM oracle_assignments WHERE bet_id = ? AND arbiter_id = ?",
     [betId, arbiterId],
@@ -563,14 +592,18 @@ export function isAssignedArbiter(betId, arbiterId) {
   return Boolean(row?.ok);
 }
 
-export function submitVote(betId, arbiterId, vote) {
+function submitVote(betId, arbiterId, vote) {
+  if (get("SELECT 1 AS ok FROM oracle_votes WHERE bet_id = ? AND arbiter_id = ?", [betId, arbiterId])) {
+    return false;
+  }
   write(`
     INSERT OR IGNORE INTO oracle_votes (bet_id, arbiter_id, vote, voted_at)
     VALUES (?, ?, ?, ?)
   `, [betId, arbiterId, vote, now()]);
+  return true;
 }
 
-export function getVotes(betId) {
+function getVotes(betId) {
   return all(`
     SELECT *
     FROM oracle_votes
@@ -579,7 +612,7 @@ export function getVotes(betId) {
   `, [betId]);
 }
 
-export function tallyVotes(betId) {
+function tallyVotes(betId) {
   const votes = getVotes(betId);
   const counts = new Map();
 
@@ -596,17 +629,45 @@ export function tallyVotes(betId) {
   return null;
 }
 
-const compatDb = {
-  prepare(sql) {
-    return {
-      all: (...params) => all(sql, params),
-      get: (...params) => get(sql, params),
-      run: (...params) => {
-        write(sql, params);
-        return { changes: 1 };
-      },
-    };
-  },
-};
+function getReferralCount(telegramId) {
+  return Number(get("SELECT COUNT(*) AS count FROM users WHERE referred_by = ?", [telegramId])?.count ?? 0);
+}
 
-export default compatDb;
+function getRecordCounts() {
+  return {
+    users: Number(get("SELECT COUNT(*) AS count FROM users")?.count ?? 0),
+    bets: Number(get("SELECT COUNT(*) AS count FROM bets")?.count ?? 0),
+  };
+}
+
+function removeBets(betIds = []) {
+  for (const betId of betIds) {
+    write("DELETE FROM bets WHERE id = ?", [betId]);
+  }
+}
+
+function removeUsers(userIds = []) {
+  for (const userId of userIds) {
+    write("DELETE FROM users WHERE telegram_id = ?", [userId]);
+  }
+}
+
+function close() {
+  db.close();
+}
+
+  return {
+    initialize: initDB,
+    close,
+    upsertUser, getUser, saveTonAddress, getTonAddress,
+    getRandomArbiters, getArbiterCount, getBootstrapArbiters, getArbiters,
+    becomeArbiter, setPremiumArbiter, isPremiumArbiter, getPremiumArbiters,
+    getReferrer, setReferrer, incrementReferralEarnings, getReferralCount, getArbiterAccuracy,
+    createBet, getBet, getBetsByUser, getLatestUserBet, getCompletedBetsCount,
+    hideBetForUser, getPendingBets, getBetsByStatus, getExpiredBets,
+    getExpiredActiveBets, getExpiredPendingBets, joinBet, confirmDeposit,
+    areBothDeposited, activateBet, submitOutcome, resolveOutcomes, startOracle,
+    finalizeBet, refundBet, assignArbiters, getAssignedArbiters, isAssignedArbiter,
+    submitVote, getVotes, tallyVotes, getRecordCounts, removeBets, removeUsers,
+  };
+}

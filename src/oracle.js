@@ -1,20 +1,5 @@
 ﻿import { Markup } from "telegraf";
-import {
-  assignArbiters,
-  finalizeBet,
-  getBet,
-  getArbiters,
-  getAssignedArbiters,
-  getPremiumArbiters,
-  getTonAddress,
-  getVotes,
-  isAssignedArbiter,
-  isPremiumArbiter,
-  refundBet,
-  startOracle,
-  submitVote,
-  tallyVotes,
-} from "./db.js";
+import { getDatabase } from "./db/index.js";
 import { analyzeBetDescription } from "./assistant.js";
 import { runArbiterEngine } from "./engine.js";
 import { logger } from "./logger.js";
@@ -45,13 +30,14 @@ export async function safeNotify(bot, userId, text) {
 
 async function finalizeWithOracle(bet, winnerId, bot) {
   logger.info(`Starting finalizeWithOracle for bet_id: ${bet.id}`);
-  const winnerAddress = getTonAddress(winnerId);
+  const database = getDatabase();
+  const winnerAddress = await database.users.getTonAddress(winnerId);
   const loserId = Number(winnerId) === Number(bet.creator_id) ? bet.opponent_id : bet.creator_id;
   const winnerLabel = Number(winnerId) === Number(bet.creator_id) ? "Player A" : "Player B";
 
   if (!winnerAddress) {
     logger.warn(`finalizeWithOracle missing winner address for bet_id: ${bet.id}`);
-    finalizeBet(bet.id, winnerId, "pending_address");
+    await database.bets.finalize(bet.id, winnerId, "pending_address");
     await safeNotify(
       bot,
       winnerId,
@@ -62,8 +48,10 @@ async function finalizeWithOracle(bet, winnerId, bot) {
     return;
   }
 
-  const arbiterVotes = getVotes(bet.id);
-  const arbiterAddresses = arbiterVotes.map((row) => getTonAddress(row.arbiter_id)).filter(Boolean);
+  const arbiterVotes = await database.oracle.getVotes(bet.id);
+  const arbiterAddresses = (await Promise.all(
+    arbiterVotes.map((row) => database.users.getTonAddress(row.arbiter_id)),
+  )).filter(Boolean);
 
   let payoutResult;
   try {
@@ -85,7 +73,7 @@ async function finalizeWithOracle(bet, winnerId, bot) {
     return;
   }
 
-  finalizeBet(bet.id, winnerId, payoutResult.winnerTxHash);
+  await database.bets.finalize(bet.id, winnerId, payoutResult.winnerTxHash);
   if (oracleRetryTimers.has(bet.id)) {
     clearInterval(oracleRetryTimers.get(bet.id));
     oracleRetryTimers.delete(bet.id);
@@ -117,8 +105,8 @@ function scheduleOracleRetry(betId, bot) {
     return;
   }
 
-  const timer = setInterval(async () => {
-    const currentBet = getBet(betId);
+  const timer = setInterval(() => { (async () => {
+    const currentBet = await getDatabase().bets.getById(betId);
     if (!currentBet || currentBet.status !== "oracle") {
       clearInterval(timer);
       oracleRetryTimers.delete(betId);
@@ -130,19 +118,20 @@ function scheduleOracleRetry(betId, bot) {
       clearInterval(timer);
       oracleRetryTimers.delete(betId);
     }
-  }, 30 * 60 * 1000);
+  })().catch((error) => logger.error(`[ORACLE] retry failed for bet ${betId}: ${error?.name || "Error"}`)); }, 30 * 60 * 1000);
 
   oracleRetryTimers.set(betId, timer);
 }
 
 async function notifyArbitersForBet(bet, bot) {
+  const database = getDatabase();
   const insight = analyzeBetDescription(bet.description);
   const rewardAmount = Number(((Number(bet.amount_ton) * 2 * ARBITER_FEE) / ARBITER_COUNT).toFixed(9));
   const arbiterCardImage = process.env.ARBITER_CARD_IMAGE_URL || DEFAULT_ARBITER_CARD_IMAGE;
-  const premiumArbiters = getPremiumArbiters([bet.creator_id, bet.opponent_id]);
+  const premiumArbiters = await database.users.getPremiumArbiters([bet.creator_id, bet.opponent_id]);
   const needed = Math.max(0, ARBITER_COUNT - premiumArbiters.length);
   const regularArbiters = needed > 0
-    ? getArbiters(
+    ? await database.users.getArbiters(
       [bet.creator_id, bet.opponent_id, ...premiumArbiters.map((arbiter) => arbiter.telegram_id)],
       needed,
     )
@@ -173,11 +162,11 @@ async function notifyArbitersForBet(bet, bot) {
     [Markup.button.callback("✅ Player B is right", `vote:${bet.id}:${bet.opponent_id}`)],
   ]);
 
-  assignArbiters(bet.id, arbiters.map((arbiter) => arbiter.telegram_id));
+  await database.oracle.assign(bet.id, arbiters.map((arbiter) => arbiter.telegram_id));
 
   for (const arbiter of arbiters) {
     const aiNote = `🤖 *AI Note:* Objective evidence was not strong enough for automatic resolution.\nThis dispute requires human judgment.\n\n`;
-    const premiumNote = isPremiumArbiter(arbiter.telegram_id)
+    const premiumNote = await database.users.isPremiumArbiter(arbiter.telegram_id)
       ? "⭐️ *Premium Arbiter:* priority access enabled.\n\n"
       : "";
     const body =
@@ -243,7 +232,7 @@ export async function startOracleForBet(bet, bot) {
       return -2;
     }
 
-    startOracle(bet.id);
+    await getDatabase().bets.startOracle(bet.id);
     const result = await notifyArbitersForBet(bet, bot);
     logger.info(`startOracleForBet completed successfully: ${result}`);
     return result;
@@ -260,12 +249,13 @@ export async function startOracleForBet(bet, bot) {
 }
 
 export async function handleArbiterVote(betId, arbiterId, voteFor, bot) {
-  const bet = getBet(betId);
+  const database = getDatabase();
+  const bet = await database.bets.getById(betId);
   if (!bet || bet.status !== "oracle") {
     return { done: false, winnerId: null, error: "Oracle voting is not available for this bet." };
   }
 
-  if (!isAssignedArbiter(betId, arbiterId)) {
+  if (!await database.oracle.isAssigned(betId, arbiterId)) {
     return { done: false, winnerId: null, error: "You are not assigned to this dispute." };
   }
 
@@ -273,8 +263,11 @@ export async function handleArbiterVote(betId, arbiterId, voteFor, bot) {
     return { done: false, winnerId: null, error: "Invalid winner target." };
   }
 
-  submitVote(betId, arbiterId, voteFor);
-  const winnerId = tallyVotes(betId);
+  const accepted = await database.oracle.submitVote(betId, arbiterId, voteFor);
+  if (!accepted) {
+    return { done: false, winnerId: null, error: "You have already voted on this dispute." };
+  }
+  const winnerId = await database.oracle.tallyVotes(betId);
 
   if (!winnerId) {
     return { done: false, winnerId: null };
@@ -286,8 +279,9 @@ export async function handleArbiterVote(betId, arbiterId, voteFor, bot) {
 
 export async function handleOracleRefund(bet, bot, reason) {
   logger.info(`Starting handleOracleRefund for bet_id: ${bet.id}`);
-  const address1 = getTonAddress(bet.creator_id);
-  const address2 = getTonAddress(bet.opponent_id);
+  const database = getDatabase();
+  const address1 = await database.users.getTonAddress(bet.creator_id);
+  const address2 = await database.users.getTonAddress(bet.opponent_id);
 
   if (address1 && address2 && bet.creator_deposit && bet.opponent_deposit) {
     try {
@@ -299,7 +293,7 @@ export async function handleOracleRefund(bet, bot, reason) {
     }
   }
 
-  refundBet(bet.id);
+  await database.bets.refund(bet.id);
 
   await safeNotify(bot, bet.creator_id, `Bet #${bet.id} was refunded.\nReason: ${escapeMarkdown(reason)}`);
   await safeNotify(bot, bet.opponent_id, `Bet #${bet.id} was refunded.\nReason: ${escapeMarkdown(reason)}`);
