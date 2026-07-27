@@ -4,7 +4,7 @@ import { logger } from "./logger.js";
 const DEV_CHAT_ID = process.env.DEV_CHAT_ID ? Number(process.env.DEV_CHAT_ID) : null;
 
 function truncate(text, max = 3500) {
-  const value = String(text ?? "");
+  const value = String(text ?? "").replace(/\b(?:EQ|UQ)[A-Za-z0-9_-]{46}\b/g, "<wallet:redacted>");
   return value.length > max ? `${value.slice(0, max - 3)}...` : value;
 }
 

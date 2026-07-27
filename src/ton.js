@@ -10,7 +10,7 @@ import {
   WalletContractV4,
   WalletContractV5R1,
 } from "@ton/ton";
-import { logger } from "./logger.js";
+import { logger, redactWalletAddress } from "./logger.js";
 import { getBet, getReferrer, getTonAddress, incrementReferralEarnings } from "./db.js";
 import {
   AI_WINNER_GETS,
@@ -643,7 +643,7 @@ export async function getWalletAddress() {
 }
 
 export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
-  logger.info(`Starting verifyDeposit for wallet: ${fromAddress}, amount: ${expectedTon}`);
+  logger.info(`Starting verifyDeposit for wallet: ${redactWalletAddress(fromAddress)}, amount: ${expectedTon}`);
   const walletAddress = await getWalletAddress();
   const url = new URL(`${TONCENTER_API_BASE}/getTransactions`);
   url.searchParams.set("address", walletAddress);
@@ -665,7 +665,7 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
   const amountMatchedFrom = new Set();
 
   logger.info(
-    `verifyDeposit scanning ${transactions.length} txs for deposit wallet: ${walletAddress}, sender: ${normalizedFrom}, minUnix: ${minUnix}`,
+    `verifyDeposit scanning ${transactions.length} txs for deposit wallet: ${redactWalletAddress(walletAddress)}, sender: ${redactWalletAddress(normalizedFrom)}, minUnix: ${minUnix}`,
   );
 
   for (const tx of transactions) {
@@ -700,7 +700,7 @@ export async function verifyDeposit(fromAddress, expectedTon, sinceUnix) {
       `verifyDeposit found matching amount from different sender(s): ${Array.from(amountMatchedFrom).join(", ")}`,
     );
   }
-  logger.warn(`verifyDeposit failed to find matching transaction for wallet: ${fromAddress}, amount: ${expectedTon}`);
+  logger.warn(`verifyDeposit failed to find matching transaction for wallet: ${redactWalletAddress(fromAddress)}, amount: ${expectedTon}`);
   return null;
 }
 
@@ -827,7 +827,7 @@ async function verifyTxOnChain(txHash) {
 }
 
 export async function executePayout(betId, winnerAddress, potTon) {
-  logger.info(`[PAYOUT] Bet #${betId} | Pot: ${potTon} TON | Winner: ${winnerAddress}`);
+  logger.info(`[PAYOUT] Bet #${betId} | Pot: ${potTon} TON | Winner: ${redactWalletAddress(winnerAddress)}`);
 
   const totalPot = Number(potTon);
   const winnerAmount = Number((totalPot * AI_WINNER_GETS).toFixed(9));
@@ -988,7 +988,7 @@ export async function refundSingle(address, amountTon) {
 export async function checkMcpHealth() {
   try {
     const address = await getWalletAddress();
-    console.log(`TON wallet: ${address}`);
+    console.log(`TON wallet: ${redactWalletAddress(address)}`);
     return true;
   } catch (error) {
     console.error("MCP health check failed:", humanizeTonError(error));

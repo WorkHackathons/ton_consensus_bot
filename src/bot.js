@@ -1,5 +1,3 @@
-import "dotenv/config";
-import express from "express";
 import { Markup, Telegraf } from "telegraf";
 import {
   activateBet,
@@ -23,21 +21,15 @@ import {
   upsertUser,
 } from "./db.js";
 import db from "./db.js";
-import createApiRouter from "./api.js";
 import { logger } from "./logger.js";
 import { handleArbiterVote, handleOracleRefund, safeNotify, startOracleForBet } from "./oracle.js";
 import { BET_STATUS, OUTCOME } from "./states.js";
-import { checkMcpHealth, payout, refundBoth, refundSingle } from "./ton.js";
-import { notifyDev, notifyDevInfo } from "./devNotify.js";
-import { runAndNotifySelfTest } from "./selftest.js";
+import { payout, refundBoth, refundSingle } from "./ton.js";
+import { notifyDev } from "./devNotify.js";
 
 const token = process.env.TELEGRAM_TOKEN;
-if (!token) {
-  console.error("TELEGRAM_TOKEN is required");
-  process.exit(1);
-}
-
-const bot = new Telegraf(token);
+// Configuration is validated by src/server.js. The placeholder keeps handler registration testable.
+const bot = new Telegraf(token || "telegram-disabled-for-tests");
 const TONSCAN = process.env.NETWORK === "mainnet" ? "https://tonscan.org" : "https://testnet.tonscan.org";
 const ARBITER_INVITE_IMAGE = "https://github.com/WorkHackathons/ton_consensus_bot/blob/main/photo_2026-03-20_23-19-26.jpg?raw=true";
 const BET_SHARE_IMAGE = "https://raw.githubusercontent.com/WorkHackathons/ton_consensus_bot/main/photo_2026-03-20_18-21-48.jpg";
@@ -120,35 +112,6 @@ async function sendBetShareCard(chatId, bet) {
 }
 
 logger.info(`[PREMIUM] ${premiumIds.length} premium arbiters initialized`);
-
-if (process.env.DISABLE_BOT_LAUNCH !== "1") {
-  const app = express();
-
-  app.get("/tonconnect-manifest.json", (req, res) => {
-    const baseUrl = process.env.MINIAPP_URL?.replace(/\/$/, "") || `http://localhost:${process.env.API_PORT || 3001}/miniapp`;
-    const origin = (() => {
-      try {
-        return new URL(baseUrl).origin;
-      } catch {
-        return `http://localhost:${process.env.API_PORT || 3001}`;
-      }
-    })();
-
-    res.json({
-      url: baseUrl,
-      name: "TON Consensus",
-      iconUrl: `${origin}/miniapp/icon.svg`,
-      termsOfUseUrl: baseUrl,
-      privacyPolicyUrl: baseUrl,
-    });
-  });
-
-  app.use("/api", createApiRouter(bot));
-  app.use("/miniapp", express.static("miniapp-react/dist"));
-  app.listen(process.env.API_PORT || 3001, () => console.log(`API on ${process.env.API_PORT || 3001}`));
-}
-
-checkMcpHealth().catch(() => console.warn("MCP unavailable, continuing..."));
 
 async function activateBetFlow(betId) {
   activateBet(betId);
@@ -686,7 +649,11 @@ bot.action(/^vote:(\d+):(\d+)$/, async (ctx) => {
   await ctx.editMessageText("Vote accepted. Waiting for more arbiter votes.");
 });
 
-setInterval(async () => {
+let botJobsTimer = null;
+
+export function startBotJobs() {
+  if (botJobsTimer) return;
+  botJobsTimer = setInterval(async () => {
   const now = Math.floor(Date.now() / 1000);
 
   const expiredActive = db.prepare(`
@@ -815,7 +782,13 @@ setInterval(async () => {
       console.error(`Expired bet handler failed for bet ${bet.id}:`, error.message);
     }
   }
-}, 60 * 1000);
+  }, 60 * 1000);
+}
+
+export function stopBotJobs() {
+  if (botJobsTimer) clearInterval(botJobsTimer);
+  botJobsTimer = null;
+}
 
 async function launchBotWithRetry(attempt = 1) {
   try {
@@ -878,19 +851,9 @@ bot.catch(async (error, ctx) => {
   await notifyDev(`🤖 BOT HANDLER FAILED\nUpdate: ${updateId}\nError: ${message}`);
 });
 
-bot.command("selftest", async (ctx) => {
-  const devChatId = Number(process.env.DEV_CHAT_ID || 0);
-  if (!devChatId || Number(ctx.from.id) !== devChatId) {
-    await ctx.reply("This command is restricted.");
-    return;
-  }
-
-  await ctx.reply("Running self-test...");
-  const result = await runAndNotifySelfTest(bot, "manual");
-  await ctx.reply(result.ok ? "Self-test passed." : `Self-test finished with ${result.failedCount} failures.`);
-});
-
-if (process.env.DISABLE_BOT_LAUNCH !== "1") {
+// Process startup is owned by src/server.js. This legacy block stays inert so
+// handlers remain unchanged while retries cannot create a second bot launch.
+if (false) {
   launchBotWithRetry().catch(handleFatalLaunchFailure);
 
   process.once("SIGINT", async () => {
@@ -911,13 +874,13 @@ if (process.env.DISABLE_BOT_LAUNCH !== "1") {
   }, 6 * 60 * 60 * 1000);
 }
 
-process.on("unhandledRejection", async (reason) => {
+if (false) process.on("unhandledRejection", async (reason) => {
   const message = reason instanceof Error ? `${reason.message}\n${reason.stack || ""}` : String(reason);
   logger.error(`[PROCESS] unhandledRejection: ${message}`);
   await notifyDev(`⚠️ UNHANDLED REJECTION\n${message}`);
 });
 
-process.on("uncaughtException", async (error) => {
+if (false) process.on("uncaughtException", async (error) => {
   const message = error instanceof Error ? `${error.message}\n${error.stack || ""}` : String(error);
   logger.error(`[PROCESS] uncaughtException: ${message}`);
   await notifyDev(`💥 UNCAUGHT EXCEPTION\n${message}`);

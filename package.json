@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node src/bot.js",
-    "dev": "node --watch src/bot.js",
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
     "mcp": "node --env-file=.env node_modules/@ton/mcp/dist/cli.js --http 3000"
   },
   "dependencies": {

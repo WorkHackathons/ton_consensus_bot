@@ -3,6 +3,11 @@ import { mkdirSync } from "node:fs";
 
 mkdirSync("logs", { recursive: true });
 
+export function redactWalletAddress(address) {
+  const value = String(address || "");
+  return value.length > 12 ? `<wallet:${value.slice(0, 4)}...${value.slice(-4)}>` : "<wallet:redacted>";
+}
+
 export const logger = createLogger({
   level: "info",
   format: format.combine(

@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: ton-consensus-bot
+    runtime: node
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: NETWORK
+        value: testnet
+      - key: TELEGRAM_MODE
+        value: webhook
+      - key: TELEGRAM_WEBHOOK_PATH
+        value: /telegram/webhook
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: MINIAPP_URL
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true
