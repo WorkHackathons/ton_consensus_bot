@@ -98,12 +98,21 @@ const OutcomeSchema = z.object({
 async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
   logger.info(`Starting payoutForBet for bet_id: ${bet.id}`);
   const database = getDatabase();
+  const claim = await database.bets.claimSettlement(bet.id, {
+    eligibleStatuses: [BET_STATUS.active, BET_STATUS.confirming],
+    kind: "api_payout",
+    winnerId,
+  });
+  if (!claim.claimed) return { txHash: false };
+
+  const claimedBet = claim.bet;
   const winnerAddress = await database.users.getTonAddress(winnerId);
-  const loserId = Number(winnerId) === Number(bet.creator_id) ? bet.opponent_id : bet.creator_id;
+  const loserId = Number(winnerId) === Number(claimedBet.creator_id) ? claimedBet.opponent_id : claimedBet.creator_id;
 
   if (!winnerAddress) {
     logger.warn(`payoutForBet missing winner address for bet_id: ${bet.id}`);
-    await database.bets.finalize(bet.id, winnerId, "pending_address");
+    const finalization = await database.bets.finalizeClaimedSettlement(claimedBet.id, { winnerId, txHash: "pending_address" });
+    if (!finalization.finalized) return { txHash: false };
     await safeNotify(bot, winnerId, `You won bet #${bet.id}, but your TON address is missing in the Mini App.`);
     await safeNotify(bot, loserId, `Bet #${bet.id} finished. Winner payout is waiting for a wallet address.`);
     logger.info(`payoutForBet completed successfully: pending_address`);
@@ -112,14 +121,21 @@ async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
 
   try {
     const payoutResult = await payout({
-      betId: bet.id,
+      betId: claimedBet.id,
       winnerAddress,
-      potTon: Number(bet.amount_ton) * 2,
+      potTon: Number(claimedBet.amount_ton) * 2,
       oracleUsed: false,
       arbiterAddresses: [],
     });
 
-    await database.bets.finalize(bet.id, winnerId, payoutResult.winnerTxHash);
+    const finalization = await database.bets.finalizeClaimedSettlement(claimedBet.id, {
+      winnerId,
+      txHash: payoutResult.winnerTxHash,
+    });
+    if (!finalization.finalized) {
+      await database.bets.markSettlementUncertain(claimedBet.id, "Payout succeeded but finalization was rejected");
+      return { txHash: false };
+    }
 
     await safeNotify(
       bot,
@@ -131,6 +147,11 @@ async function payoutForBet({ bet, winnerId, bot, tonscanBase }) {
     return { txHash: payoutResult.winnerTxHash };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+      await database.bets.markSettlementFailed(claimedBet.id, message);
+    } else {
+      await database.bets.markSettlementUncertain(claimedBet.id, message);
+    }
     logger.error(`payoutForBet failed for bet_id: ${bet.id}, reason: ${message}`);
     await notifyDev(`💸 PAYOUT FAILED\nBet: ${bet.id}\nWinner: ${winnerAddress}\nAmount: ${Number(bet.amount_ton) * 2}\nError: ${message}`);
     return { txHash: false };
@@ -292,7 +313,7 @@ export default function createApiRouter(bot) {
     }
 
     if (bet.status !== BET_STATUS.pending || bet.opponent_id) {
-      return res.status(400).json({ error: "This bet can no longer be joined" });
+      return res.status(409).json({ error: "This bet can no longer be joined" });
     }
 
     if (Number(bet.creator_id) === Number(result.data.opponent_id)) {
@@ -300,13 +321,17 @@ export default function createApiRouter(bot) {
     }
 
     await database.users.upsert(result.data.opponent_id, result.data.username ?? null);
-    await database.bets.join(betId, result.data.opponent_id);
-    const joinedBet = await database.bets.getById(betId);
-    const opponentUser = await database.users.getByTelegramId(result.data.opponent_id);
+    const joinResult = await database.bets.join(betId, result.data.opponent_id, { at: now });
+    if (!joinResult.joined) {
+      const status = joinResult.reason === "not_found" ? 404 : 409;
+      return res.status(status).json({ error: "This bet can no longer be joined" });
+    }
+    const joinedBet = joinResult.bet;
+    const opponentUser = await database.users.getByTelegramId(joinedBet.opponent_id);
     const opponentLabel = opponentUser?.username ? `@${opponentUser.username}` : "Your opponent";
     await safeNotify(
       bot,
-      bet.creator_id,
+      joinedBet.creator_id,
       `⚡ Your challenge was accepted.\n\n${opponentLabel} is now inside the Mini App and waiting for you to complete the deposit step.`, 
     );
     return res.json({ ok: true, bet: joinedBet });
@@ -337,6 +362,10 @@ export default function createApiRouter(bot) {
 
     if (bet.deadline && Number(bet.deadline) < now) {
       return res.status(400).json({ error: "Bet deadline has passed. Refund will be processed." });
+    }
+
+    if (bet.status !== BET_STATUS.pending) {
+      return res.status(409).json({ error: "This deposit can no longer be confirmed" });
     }
 
     let role = null;
@@ -386,12 +415,17 @@ export default function createApiRouter(bot) {
     if (matchedAddress && matchedAddress !== savedAddress) {
       await database.users.saveTonAddress(result.data.telegram_id, matchedAddress);
     }
-    await database.deposits.confirm(betId, role);
-    if (await database.deposits.areBothConfirmed(betId)) {
-      await database.bets.activate(betId);
+    const confirmation = await database.deposits.confirmAndMaybeActivate(betId, {
+      role,
+      participantId: result.data.telegram_id,
+      at: Math.floor(Date.now() / 1000),
+    });
+    if (!confirmation.accepted) {
+      const status = confirmation.reason === "not_found" ? 404 : confirmation.reason === "not_participant" ? 403 : 409;
+      return res.status(status).json({ error: "This deposit can no longer be confirmed", reason: confirmation.reason });
     }
 
-    return res.json({ ok: true, role, txHash: verifiedTxHash, bet: await database.bets.getById(betId) });
+    return res.json({ ok: true, role, txHash: verifiedTxHash, bet: confirmation.bet });
   }));
 
   router.post("/bets/:id/outcome", express.json(), asyncRoute(async (req, res) => {
@@ -430,7 +464,10 @@ export default function createApiRouter(bot) {
       return res.status(400).json({ error: "Outcome already submitted" });
     }
 
-    await database.outcomes.submit(betId, result.data.telegram_id, result.data.outcome);
+    const submitted = await database.outcomes.submit(betId, result.data.telegram_id, result.data.outcome);
+    if (!submitted) {
+      return res.status(409).json({ error: "This bet can no longer accept outcomes" });
+    }
     const updatedBet = await database.bets.getById(betId);
     const resolution = await database.outcomes.resolve(betId);
 
@@ -515,7 +552,8 @@ export default function createApiRouter(bot) {
 
     const result = await handleArbiterVote(betId, arbiterId, voteFor, bot);
     if (result.error) {
-      return res.status(403).json({ error: result.error });
+      const settlementError = /settlement|failed|uncertain/i.test(result.error);
+      return res.status(settlementError ? 409 : 403).json({ error: result.error });
     }
     return res.json({ ok: true, ...result, bet: await getDatabase().bets.getById(betId) });
   }));

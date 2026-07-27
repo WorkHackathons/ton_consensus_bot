@@ -12,8 +12,8 @@ export const DATABASE_BACKENDS = Object.freeze({ legacy: "legacy", postgres: "po
 export const DATABASE_CONTRACT_OPERATIONS = Object.freeze({
   users: ["upsert", "getByTelegramId", "saveTonAddress", "getTonAddress", "becomeArbiter", "setPremiumArbiter", "isPremiumArbiter", "getArbiters", "getRandomArbiters", "getBootstrapArbiters", "getPremiumArbiters"],
   referrals: ["get", "set", "incrementEarnings", "count"],
-  bets: ["create", "getById", "getByUser", "getLatestByUser", "hideForUser", "getPending", "getByStatus", "getExpired", "getExpiredActive", "getExpiredPending", "join", "activate", "refund", "finalize", "startOracle"],
-  deposits: ["confirm", "areBothConfirmed"],
+  bets: ["create", "getById", "getByUser", "getLatestByUser", "hideForUser", "getPending", "getByStatus", "getExpired", "getExpiredActive", "getExpiredPending", "join", "activate", "refund", "finalize", "startOracle", "claimSettlement", "finalizeClaimedSettlement", "markSettlementFailed", "markSettlementUncertain"],
+  deposits: ["confirm", "areBothConfirmed", "confirmAndMaybeActivate"],
   outcomes: ["submit", "resolve"],
   oracle: ["assign", "getAssignments", "isAssigned", "submitVote", "getVotes", "tallyVotes"],
   reporting: ["arbiterCount", "completedBetsCount", "arbiterAccuracy", "recordCounts"],

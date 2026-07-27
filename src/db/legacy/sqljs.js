@@ -12,7 +12,7 @@ const DEFAULT_DB_PATH = path.resolve(__dirname, "../../../data/consensus.db");
  * The only sql.js implementation. The public adapter wraps this store in
  * Promises so no application consumer can reach sql.js directly.
  */
-export async function createSqlJsLegacyStore({ databasePath = process.env.DATABASE_PATH || DEFAULT_DB_PATH } = {}) {
+export async function createSqlJsLegacyStore({ databasePath = DEFAULT_DB_PATH } = {}) {
   const dataDir = path.dirname(databasePath);
   const SQL = await initSqlJs({
     locateFile: (file) => path.resolve(__dirname, "../../../node_modules/sql.js/dist", file),
@@ -102,6 +102,11 @@ function initDB() {
       creator_deposit INTEGER NOT NULL DEFAULT 0,
       opponent_deposit INTEGER NOT NULL DEFAULT 0,
       payout_txhash TEXT,
+      settlement_kind TEXT,
+      settlement_winner_id INTEGER,
+      settlement_claimed_at INTEGER,
+      settlement_finalized_at INTEGER,
+      settlement_error TEXT,
       created_at INTEGER NOT NULL,
       deadline INTEGER,
       hidden_by_creator INTEGER NOT NULL DEFAULT 0,
@@ -141,6 +146,11 @@ function initDB() {
   ensureColumn("users", "referred_by", "INTEGER DEFAULT NULL");
   ensureColumn("users", "referral_earnings", "REAL NOT NULL DEFAULT 0");
   ensureColumn("bets", "oracle_deadline", "INTEGER DEFAULT NULL");
+  ensureColumn("bets", "settlement_kind", "TEXT DEFAULT NULL");
+  ensureColumn("bets", "settlement_winner_id", "INTEGER DEFAULT NULL");
+  ensureColumn("bets", "settlement_claimed_at", "INTEGER DEFAULT NULL");
+  ensureColumn("bets", "settlement_finalized_at", "INTEGER DEFAULT NULL");
+  ensureColumn("bets", "settlement_error", "TEXT DEFAULT NULL");
   ensureColumn("bets", "hidden_by_creator", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn("bets", "hidden_by_opponent", "INTEGER NOT NULL DEFAULT 0");
   saveDB();
@@ -404,19 +414,47 @@ function getExpiredBets() {
         OR
         (status != ? AND deadline IS NOT NULL AND deadline < ?)
       )
-      AND status NOT IN (?, ?)
+      AND status NOT IN (?, ?, ?, ?, ?)
     ORDER BY COALESCE(oracle_deadline, deadline) ASC
-  `, [BET_STATUS.oracle, now(), BET_STATUS.oracle, now(), BET_STATUS.done, BET_STATUS.refunded]);
+  `, [
+    BET_STATUS.oracle,
+    now(),
+    BET_STATUS.oracle,
+    now(),
+    BET_STATUS.done,
+    BET_STATUS.refunded,
+    BET_STATUS.settling,
+    BET_STATUS.settlement_failed,
+    BET_STATUS.settlement_uncertain,
+  ]);
 }
 
-function joinBet(betId, opponentId) {
-  write(`
+function joinBet(betId, opponentId, { at = now() } = {}) {
+  const before = getBet(betId);
+  if (!before) return { joined: false, reason: "not_found", bet: null };
+  if (Number(before.creator_id) === Number(opponentId)) {
+    return { joined: false, reason: "self_join", bet: before };
+  }
+  if (before.status !== BET_STATUS.pending || before.opponent_id) {
+    return { joined: false, reason: "not_available", bet: before };
+  }
+  if (before.deadline && Number(before.deadline) < at) {
+    return { joined: false, reason: "expired", bet: before };
+  }
+
+  run(`
     UPDATE bets
     SET opponent_id = ?
     WHERE id = ?
       AND status = ?
       AND opponent_id IS NULL
-  `, [opponentId, betId, BET_STATUS.pending]);
+      AND (deadline IS NULL OR deadline >= ?)
+  `, [opponentId, betId, BET_STATUS.pending, at]);
+  if (db.getRowsModified() !== 1) {
+    return { joined: false, reason: "not_available", bet: getBet(betId) };
+  }
+  saveDB();
+  return { joined: true, reason: null, bet: getBet(betId) };
 }
 
 function confirmDeposit(betId, role) {
@@ -442,6 +480,67 @@ function areBothDeposited(betId) {
   return Boolean(row?.creator_deposit && row?.opponent_deposit);
 }
 
+function confirmAndMaybeActivate(betId, { role, participantId, at = now() } = {}) {
+  if (role !== "creator" && role !== "opponent") {
+    throw new Error("Invalid deposit role");
+  }
+
+  db.run("BEGIN");
+  try {
+    const bet = getBet(betId);
+    if (!bet) {
+      db.run("COMMIT");
+      return { accepted: false, activated: false, reason: "not_found", bet: null };
+    }
+    if (bet.status !== BET_STATUS.pending) {
+      db.run("COMMIT");
+      return { accepted: false, activated: false, reason: "not_pending", bet };
+    }
+    if (bet.deadline && Number(bet.deadline) < at) {
+      db.run("COMMIT");
+      return { accepted: false, activated: false, reason: "expired", bet };
+    }
+
+    const participantColumn = role === "creator" ? "creator_id" : "opponent_id";
+    if (Number(bet[participantColumn]) !== Number(participantId)) {
+      db.run("COMMIT");
+      return { accepted: false, activated: false, reason: "not_participant", bet };
+    }
+
+    const depositColumn = role === "creator" ? "creator_deposit" : "opponent_deposit";
+    run(`
+      UPDATE bets
+      SET ${depositColumn} = 1
+      WHERE id = ?
+        AND status = ?
+        AND (deadline IS NULL OR deadline >= ?)
+    `, [betId, BET_STATUS.pending, at]);
+    if (db.getRowsModified() !== 1) {
+      const current = getBet(betId);
+      db.run("COMMIT");
+      return { accepted: false, activated: false, reason: "not_pending", bet: current };
+    }
+
+    const confirmedBet = getBet(betId);
+    let activated = false;
+    if (confirmedBet.creator_deposit && confirmedBet.opponent_deposit) {
+      run(`
+        UPDATE bets
+        SET status = ?
+        WHERE id = ?
+          AND status = ?
+      `, [BET_STATUS.active, betId, BET_STATUS.pending]);
+      activated = db.getRowsModified() === 1;
+    }
+    db.run("COMMIT");
+    saveDB();
+    return { accepted: true, activated, reason: null, bet: getBet(betId) };
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
+  }
+}
+
 function activateBet(betId) {
   write(`
     UPDATE bets
@@ -453,37 +552,46 @@ function activateBet(betId) {
 function submitOutcome(betId, userId, outcome) {
   const bet = getBet(betId);
   if (!bet) {
-    return;
+    return false;
   }
 
   if (Number(userId) === Number(bet.creator_id)) {
     if (bet.creator_outcome) {
-      return;
+      return false;
     }
 
-    write(`
+    run(`
       UPDATE bets
       SET creator_outcome = ?,
           status = ?
       WHERE id = ?
         AND creator_outcome IS NULL
-    `, [outcome, BET_STATUS.confirming, betId]);
-    return;
+        AND status IN (?, ?)
+    `, [outcome, BET_STATUS.confirming, betId, BET_STATUS.active, BET_STATUS.confirming]);
+    const submitted = db.getRowsModified() === 1;
+    if (submitted) saveDB();
+    return submitted;
   }
 
   if (Number(userId) === Number(bet.opponent_id)) {
     if (bet.opponent_outcome) {
-      return;
+      return false;
     }
 
-    write(`
+    run(`
       UPDATE bets
       SET opponent_outcome = ?,
           status = ?
       WHERE id = ?
         AND opponent_outcome IS NULL
-    `, [outcome, BET_STATUS.confirming, betId]);
+        AND status IN (?, ?)
+    `, [outcome, BET_STATUS.confirming, betId, BET_STATUS.active, BET_STATUS.confirming]);
+    const submitted = db.getRowsModified() === 1;
+    if (submitted) saveDB();
+    return submitted;
   }
+
+  return false;
 }
 
 function resolveOutcomes(betId) {
@@ -504,12 +612,16 @@ function resolveOutcomes(betId) {
 }
 
 function startOracle(betId) {
-  write(`
+  run(`
     UPDATE bets
     SET status = ?,
         oracle_deadline = ?
     WHERE id = ?
-  `, [BET_STATUS.oracle, now() + ORACLE_TIMEOUT_24H, betId]);
+      AND status IN (?, ?)
+  `, [BET_STATUS.oracle, now() + ORACLE_TIMEOUT_24H, betId, BET_STATUS.active, BET_STATUS.confirming]);
+  const started = db.getRowsModified() === 1;
+  if (started) saveDB();
+  return started;
 }
 
 function finalizeBet(betId, winnerId, txhash) {
@@ -546,6 +658,120 @@ function finalizeBet(betId, winnerId, txhash) {
     db.run("ROLLBACK");
     throw error;
   }
+}
+
+function claimSettlement(betId, { eligibleStatuses = [BET_STATUS.oracle], kind = "payout", winnerId = null } = {}) {
+  const statuses = Array.isArray(eligibleStatuses) ? [...new Set(eligibleStatuses)] : [];
+  if (statuses.length === 0) throw new Error("Settlement claim requires eligible statuses");
+
+  const placeholders = statuses.map(() => "?").join(", ");
+  db.run("BEGIN");
+  try {
+    run(`
+      UPDATE bets
+      SET status = ?,
+          settlement_kind = ?,
+          settlement_winner_id = ?,
+          settlement_claimed_at = ?,
+          settlement_error = NULL,
+          deadline = NULL,
+          oracle_deadline = NULL
+      WHERE id = ?
+        AND status IN (${placeholders})
+        AND payout_txhash IS NULL
+    `, [BET_STATUS.settling, kind, winnerId ?? null, now(), betId, ...statuses]);
+    const claimed = db.getRowsModified() === 1;
+    const bet = getBet(betId);
+    db.run("COMMIT");
+    if (claimed) saveDB();
+    return { claimed, bet };
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
+  }
+}
+
+function finalizeClaimedSettlement(betId, { winnerId = null, txHash = null, terminalStatus = BET_STATUS.done } = {}) {
+  if (terminalStatus !== BET_STATUS.done && terminalStatus !== BET_STATUS.refunded) {
+    throw new Error("Invalid settlement terminal status");
+  }
+  if (terminalStatus === BET_STATUS.done && !txHash) {
+    throw new Error("A successful payout requires a transaction hash");
+  }
+
+  db.run("BEGIN");
+  try {
+    const before = getBet(betId);
+    if (!before || before.status !== BET_STATUS.settling || before.payout_txhash) {
+      db.run("COMMIT");
+      return { finalized: false, bet: before ?? null };
+    }
+
+    if (terminalStatus === BET_STATUS.done) {
+      run(`
+        UPDATE bets
+        SET status = ?,
+            winner_id = ?,
+            payout_txhash = ?,
+            settlement_finalized_at = ?,
+            deadline = NULL,
+            oracle_deadline = NULL
+        WHERE id = ?
+          AND status = ?
+          AND payout_txhash IS NULL
+      `, [BET_STATUS.done, winnerId ?? null, txHash, now(), betId, BET_STATUS.settling]);
+    } else {
+      run(`
+        UPDATE bets
+        SET status = ?,
+            settlement_finalized_at = ?,
+            deadline = NULL,
+            oracle_deadline = NULL
+        WHERE id = ?
+          AND status = ?
+          AND payout_txhash IS NULL
+      `, [BET_STATUS.refunded, now(), betId, BET_STATUS.settling]);
+    }
+
+    const finalized = db.getRowsModified() === 1;
+    if (finalized && terminalStatus === BET_STATUS.done && before.creator_id && before.opponent_id) {
+      run(`
+        UPDATE users
+        SET bets_count = bets_count + 1
+        WHERE telegram_id IN (?, ?)
+      `, [before.creator_id, before.opponent_id]);
+    }
+    const bet = getBet(betId);
+    db.run("COMMIT");
+    if (finalized) saveDB();
+    return { finalized, bet };
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
+  }
+}
+
+function markSettlementState(betId, status, error) {
+  run(`
+    UPDATE bets
+    SET status = ?,
+        settlement_error = ?,
+        deadline = NULL,
+        oracle_deadline = NULL
+    WHERE id = ?
+      AND status = ?
+  `, [status, String(error || "Settlement outcome requires review").slice(0, 500), betId, BET_STATUS.settling]);
+  const marked = db.getRowsModified() === 1;
+  if (marked) saveDB();
+  return { marked, bet: getBet(betId) };
+}
+
+function markSettlementFailed(betId, error) {
+  return markSettlementState(betId, BET_STATUS.settlement_failed, error);
+}
+
+function markSettlementUncertain(betId, error) {
+  return markSettlementState(betId, BET_STATUS.settlement_uncertain, error);
 }
 
 function refundBet(betId) {
@@ -667,7 +893,9 @@ function close() {
     hideBetForUser, getPendingBets, getBetsByStatus, getExpiredBets,
     getExpiredActiveBets, getExpiredPendingBets, joinBet, confirmDeposit,
     areBothDeposited, activateBet, submitOutcome, resolveOutcomes, startOracle,
-    finalizeBet, refundBet, assignArbiters, getAssignedArbiters, isAssignedArbiter,
+    finalizeBet, refundBet, claimSettlement, finalizeClaimedSettlement,
+    markSettlementFailed, markSettlementUncertain, confirmAndMaybeActivate,
+    assignArbiters, getAssignedArbiters, isAssignedArbiter,
     submitVote, getVotes, tallyVotes, getRecordCounts, removeBets, removeUsers,
   };
 }

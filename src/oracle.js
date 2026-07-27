@@ -4,11 +4,33 @@ import { analyzeBetDescription } from "./assistant.js";
 import { runArbiterEngine } from "./engine.js";
 import { logger } from "./logger.js";
 import { payout, refundBoth } from "./ton.js";
-import { ARBITER_COUNT, ARBITER_FEE } from "./states.js";
+import { ARBITER_COUNT, ARBITER_FEE, BET_STATUS } from "./states.js";
 import { notifyDev } from "./devNotify.js";
 
 const oracleRetryTimers = new Map();
+let oracleRetriesStopped = false;
+let retryScheduler = { setInterval, clearInterval };
 const DEFAULT_ARBITER_CARD_IMAGE = "https://raw.githubusercontent.com/WorkHackathons/ton_consensus_bot/main/arbiter_verdict.png";
+
+export function enableOracleRetryTimers() {
+  oracleRetriesStopped = false;
+}
+
+export function stopOracleRetryTimers() {
+  oracleRetriesStopped = true;
+  for (const timer of oracleRetryTimers.values()) {
+    retryScheduler.clearInterval(timer);
+  }
+  oracleRetryTimers.clear();
+}
+
+export function configureOracleRetryTimersForTest({ setIntervalFn = setInterval, clearIntervalFn = clearInterval } = {}) {
+  retryScheduler = { setInterval: setIntervalFn, clearInterval: clearIntervalFn };
+}
+
+export function getOracleRetryTimerCount() {
+  return oracleRetryTimers.size;
+}
 
 function escapeMarkdown(text = "") {
   return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
@@ -28,7 +50,21 @@ export async function safeNotify(bot, userId, text) {
   }
 }
 
-async function finalizeWithOracle(bet, winnerId, bot) {
+function isDefinitelyPreBroadcast(error) {
+  return Boolean(error?.beforeBroadcast || error?.code === "PRE_BROADCAST");
+}
+
+async function markSettlementFailure(database, betId, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isDefinitelyPreBroadcast(error)) {
+    await database.bets.markSettlementFailed(betId, message);
+    return "failed";
+  }
+  await database.bets.markSettlementUncertain(betId, message);
+  return "uncertain";
+}
+
+async function finalizeWithOracle(bet, winnerId, bot, { payoutFn = payout } = {}) {
   logger.info(`Starting finalizeWithOracle for bet_id: ${bet.id}`);
   const database = getDatabase();
   const winnerAddress = await database.users.getTonAddress(winnerId);
@@ -37,7 +73,11 @@ async function finalizeWithOracle(bet, winnerId, bot) {
 
   if (!winnerAddress) {
     logger.warn(`finalizeWithOracle missing winner address for bet_id: ${bet.id}`);
-    await database.bets.finalize(bet.id, winnerId, "pending_address");
+    const finalization = await database.bets.finalizeClaimedSettlement(bet.id, {
+      winnerId,
+      txHash: "pending_address",
+    });
+    if (!finalization.finalized) return { settled: false, error: "Settlement claim was lost." };
     await safeNotify(
       bot,
       winnerId,
@@ -45,7 +85,7 @@ async function finalizeWithOracle(bet, winnerId, bot) {
     );
     await safeNotify(bot, loserId, `2 of 3 arbiters voted for ${winnerLabel}. Payout is waiting for the winner wallet.`);
     logger.info("finalizeWithOracle completed successfully: pending_address");
-    return;
+    return { settled: true };
   }
 
   const arbiterVotes = await database.oracle.getVotes(bet.id);
@@ -55,7 +95,7 @@ async function finalizeWithOracle(bet, winnerId, bot) {
 
   let payoutResult;
   try {
-    payoutResult = await payout({
+    payoutResult = await payoutFn({
       betId: bet.id,
       winnerAddress,
       potTon: Number(bet.amount_ton) * 2,
@@ -64,18 +104,30 @@ async function finalizeWithOracle(bet, winnerId, bot) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const failureState = await markSettlementFailure(database, bet.id, error);
     logger.error(`finalizeWithOracle failed for bet_id: ${bet.id}, reason: ${message}`);
     await notifyDev(`⚖️ ORACLE PAYOUT FAILED\nBet: ${bet.id}\nWinner: ${winnerAddress}\nAmount: ${Number(bet.amount_ton) * 2}\nError: ${message}`);
     await safeNotify(bot, bet.creator_id, `Bet #${bet.id} was resolved, but payout could not be sent yet.\n${message}`);
     if (bet.opponent_id) {
       await safeNotify(bot, bet.opponent_id, `Bet #${bet.id} was resolved, but payout could not be sent yet.\n${message}`);
     }
-    return;
+    return { settled: false, error: `${failureState}: ${message}` };
   }
 
-  await database.bets.finalize(bet.id, winnerId, payoutResult.winnerTxHash);
+  try {
+    const finalization = await database.bets.finalizeClaimedSettlement(bet.id, {
+      winnerId,
+      txHash: payoutResult?.winnerTxHash,
+    });
+    if (!finalization.finalized) {
+      return { settled: false, error: "Settlement finalization was rejected." };
+    }
+  } catch (error) {
+    await markSettlementFailure(database, bet.id, error).catch(() => {});
+    throw error;
+  }
   if (oracleRetryTimers.has(bet.id)) {
-    clearInterval(oracleRetryTimers.get(bet.id));
+    retryScheduler.clearInterval(oracleRetryTimers.get(bet.id));
     oracleRetryTimers.delete(bet.id);
   }
 
@@ -98,24 +150,27 @@ async function finalizeWithOracle(bet, winnerId, bot) {
   }
 
   logger.info(`finalizeWithOracle completed successfully: ${payoutResult.winnerTxHash}`);
+  return { settled: true };
 }
 
-function scheduleOracleRetry(betId, bot) {
-  if (oracleRetryTimers.has(betId)) {
+export function scheduleOracleRetry(betId, bot) {
+  if (oracleRetriesStopped || oracleRetryTimers.has(betId)) {
     return;
   }
 
-  const timer = setInterval(() => { (async () => {
+  const timer = retryScheduler.setInterval(() => { (async () => {
+    if (oracleRetriesStopped) return;
     const currentBet = await getDatabase().bets.getById(betId);
+    if (oracleRetriesStopped) return;
     if (!currentBet || currentBet.status !== "oracle") {
-      clearInterval(timer);
+      retryScheduler.clearInterval(timer);
       oracleRetryTimers.delete(betId);
       return;
     }
 
     const arbiters = await notifyArbitersForBet(currentBet, bot);
     if (arbiters >= 2) {
-      clearInterval(timer);
+      retryScheduler.clearInterval(timer);
       oracleRetryTimers.delete(betId);
     }
   })().catch((error) => logger.error(`[ORACLE] retry failed for bet ${betId}: ${error?.name || "Error"}`)); }, 30 * 60 * 1000);
@@ -232,8 +287,15 @@ export async function startOracleForBet(bet, bot) {
       return -2;
     }
 
-    await getDatabase().bets.startOracle(bet.id);
-    const result = await notifyArbitersForBet(bet, bot);
+    if (aiResult?.status === "settlement_in_progress") {
+      logger.warn(`startOracleForBet stopped because settlement is already claimed for bet_id ${bet.id}`);
+      return -3;
+    }
+
+    const started = await getDatabase().bets.startOracle(bet.id);
+    if (!started) return -3;
+    const currentBet = await getDatabase().bets.getById(bet.id);
+    const result = await notifyArbitersForBet(currentBet, bot);
     logger.info(`startOracleForBet completed successfully: ${result}`);
     return result;
   } catch (error) {
@@ -248,7 +310,7 @@ export async function startOracleForBet(bet, bot) {
   }
 }
 
-export async function handleArbiterVote(betId, arbiterId, voteFor, bot) {
+export async function handleArbiterVote(betId, arbiterId, voteFor, bot, { payoutFn = payout } = {}) {
   const database = getDatabase();
   const bet = await database.bets.getById(betId);
   if (!bet || bet.status !== "oracle") {
@@ -273,29 +335,61 @@ export async function handleArbiterVote(betId, arbiterId, voteFor, bot) {
     return { done: false, winnerId: null };
   }
 
-  await finalizeWithOracle(bet, winnerId, bot);
-  return { done: true, winnerId };
+  const claim = await database.bets.claimSettlement(betId, {
+    eligibleStatuses: [BET_STATUS.oracle],
+    kind: "oracle_payout",
+    winnerId,
+  });
+  if (!claim.claimed) {
+    return { done: false, winnerId: null, error: "Settlement is already being processed." };
+  }
+
+  const result = await finalizeWithOracle(claim.bet, winnerId, bot, { payoutFn });
+  return result.settled
+    ? { done: true, winnerId }
+    : { done: false, winnerId: null, error: result.error || "Settlement requires review." };
 }
 
 export async function handleOracleRefund(bet, bot, reason) {
   logger.info(`Starting handleOracleRefund for bet_id: ${bet.id}`);
   const database = getDatabase();
-  const address1 = await database.users.getTonAddress(bet.creator_id);
-  const address2 = await database.users.getTonAddress(bet.opponent_id);
+  const claim = await database.bets.claimSettlement(bet.id, {
+    eligibleStatuses: [BET_STATUS.oracle],
+    kind: "oracle_refund",
+  });
+  if (!claim.claimed) return false;
 
-  if (address1 && address2 && bet.creator_deposit && bet.opponent_deposit) {
+  const claimedBet = claim.bet;
+  const address1 = await database.users.getTonAddress(claimedBet.creator_id);
+  const address2 = await database.users.getTonAddress(claimedBet.opponent_id);
+
+  if (address1 && address2 && claimedBet.creator_deposit && claimedBet.opponent_deposit) {
     try {
-      await refundBoth(address1, address2, bet.amount_ton);
+      await refundBoth(address1, address2, claimedBet.amount_ton);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      await markSettlementFailure(database, claimedBet.id, error);
       logger.error(`handleOracleRefund failed for bet_id: ${bet.id}, reason: ${message}`);
       await notifyDev(`↩️ ORACLE REFUND FAILED\nBet: ${bet.id}\nReason: ${reason}\nError: ${message}`);
+      return false;
     }
   }
 
-  await database.bets.refund(bet.id);
+  try {
+    const finalization = await database.bets.finalizeClaimedSettlement(claimedBet.id, {
+      terminalStatus: BET_STATUS.refunded,
+    });
+    if (!finalization.finalized) {
+      await database.bets.markSettlementUncertain(claimedBet.id, "Refund succeeded but finalization was rejected");
+      return false;
+    }
+  } catch (error) {
+    await markSettlementFailure(database, claimedBet.id, error).catch(() => {});
+    return false;
+  }
 
   await safeNotify(bot, bet.creator_id, `Bet #${bet.id} was refunded.\nReason: ${escapeMarkdown(reason)}`);
   await safeNotify(bot, bet.opponent_id, `Bet #${bet.id} was refunded.\nReason: ${escapeMarkdown(reason)}`);
   logger.info(`handleOracleRefund completed successfully: refunded bet_id ${bet.id}`);
+  return true;
 }

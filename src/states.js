@@ -3,6 +3,9 @@ export const BET_STATUS = Object.freeze({
   active: "active",
   confirming: "confirming",
   oracle: "oracle",
+  settling: "settling",
+  settlement_failed: "settlement_failed",
+  settlement_uncertain: "settlement_uncertain",
   done: "done",
   refunded: "refunded",
 });

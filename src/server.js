@@ -6,12 +6,17 @@ import { parseConfig, redactConfig } from "./runtime/config.js";
 import { createRuntimeState } from "./runtime/state.js";
 import { createTelegramRuntime } from "./runtime/telegram.js";
 import { logger } from "./logger.js";
+import { enableOracleRetryTimers, stopOracleRetryTimers } from "./oracle.js";
 
 export async function startServer({ env = process.env, botInstance = bot, registerProcessHandlers = true } = {}) {
   const config = parseConfig(env, { allowDisabled: true });
   const state = createRuntimeState();
-  await initializeDatabase();
+  await initializeDatabase({
+    backend: env.DATABASE_BACKEND || "legacy",
+    legacyPath: env.DATABASE_PATH,
+  });
   state.markDatabaseInitialized();
+  enableOracleRetryTimers();
   await initializePremiumArbiters();
   const webhookHandler = config.telegramMode === "webhook" ? botInstance.webhookCallback(config.webhookPath) : undefined;
   const app = createApp({ bot: botInstance, config, state, webhookHandler });
@@ -33,6 +38,7 @@ export async function startServer({ env = process.env, botInstance = bot, regist
     closing = true;
     state.markShuttingDown();
     stopBotJobs();
+    stopOracleRetryTimers();
     await telegram.stop(reason).catch(() => {});
     await new Promise((resolve) => server.close(resolve));
     await closeDatabase().catch((error) => logger.error(`[RUNTIME] database shutdown failed: ${error?.name || "Error"}`));

@@ -71,21 +71,26 @@ test("async legacy database contract covers lifecycle, repositories, and failure
     assert.equal(Number((await database.users.getByTelegramId(101)).referral_earnings), 0.2);
 
     const settledBetId = await database.bets.create(101, "The creator wins the match", 1, Math.floor(Date.now() / 1000) + 3600);
-    await database.bets.join(settledBetId, 102);
+    const newBet = await database.bets.getById(settledBetId);
+    assert.equal(newBet.payout_txhash, null);
+    assert.equal(newBet.settlement_claimed_at, null);
+    assert.equal(newBet.settlement_error, null);
+    assert.equal((await database.bets.join(settledBetId, 102)).joined, true);
     assert.equal((await database.bets.getById(settledBetId)).opponent_id, 102);
-    await database.deposits.confirm(settledBetId, "creator");
-    await database.deposits.confirm(settledBetId, "opponent");
-    assert.equal(await database.deposits.areBothConfirmed(settledBetId), true);
-    await database.bets.activate(settledBetId);
+    assert.equal((await database.deposits.confirmAndMaybeActivate(settledBetId, { role: "creator", participantId: 101 })).accepted, true);
+    assert.equal((await database.deposits.confirmAndMaybeActivate(settledBetId, { role: "opponent", participantId: 102 })).activated, true);
     await database.outcomes.submit(settledBetId, 101, OUTCOME.win);
     await database.outcomes.submit(settledBetId, 102, OUTCOME.lose);
     assert.equal(await database.outcomes.resolve(settledBetId), 101);
-    await database.bets.finalize(settledBetId, 101, "test-settlement");
+    assert.equal((await database.bets.claimSettlement(settledBetId, { eligibleStatuses: [BET_STATUS.confirming], winnerId: 101 })).claimed, true);
+    assert.equal((await database.bets.finalizeClaimedSettlement(settledBetId, { winnerId: 101, txHash: "test-settlement" })).finalized, true);
     assert.equal((await database.bets.getById(settledBetId)).status, BET_STATUS.done);
 
     const disputeBetId = await database.bets.create(101, "The result is disputed", 1, Math.floor(Date.now() / 1000) + 3600);
     await database.bets.join(disputeBetId, 102);
-    await database.bets.startOracle(disputeBetId);
+    await database.deposits.confirmAndMaybeActivate(disputeBetId, { role: "creator", participantId: 101 });
+    await database.deposits.confirmAndMaybeActivate(disputeBetId, { role: "opponent", participantId: 102 });
+    assert.equal(await database.bets.startOracle(disputeBetId), true);
     await database.oracle.assign(disputeBetId, [103, 104, 105]);
     assert.deepEqual(await database.oracle.getAssignments(disputeBetId), [103, 104, 105]);
     assert.equal(await database.oracle.isAssigned(disputeBetId, 103), true);
@@ -93,7 +98,8 @@ test("async legacy database contract covers lifecycle, repositories, and failure
     assert.equal(await database.oracle.submitVote(disputeBetId, 103, 102), false);
     assert.equal(await database.oracle.submitVote(disputeBetId, 104, 101), true);
     assert.equal(await database.oracle.tallyVotes(disputeBetId), 101);
-    await database.bets.refund(disputeBetId);
+    assert.equal((await database.bets.claimSettlement(disputeBetId, { eligibleStatuses: [BET_STATUS.oracle], kind: "test_refund" })).claimed, true);
+    assert.equal((await database.bets.finalizeClaimedSettlement(disputeBetId, { terminalStatus: BET_STATUS.refunded })).finalized, true);
     assert.equal((await database.bets.getById(disputeBetId)).status, BET_STATUS.refunded);
 
     const app = createApp({ bot: { telegram: {} }, config: parseConfig(baseEnv), state: createRuntimeState() });

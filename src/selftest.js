@@ -70,20 +70,28 @@ async function simulateDisputeFlow() {
       Math.floor(Date.now() / 1000) + 3600,
     );
     betIds.push(instantBetId);
-    await database.bets.join(instantBetId, userB);
-    await database.deposits.confirm(instantBetId, "creator");
-    await database.deposits.confirm(instantBetId, "opponent");
-    if (!await database.deposits.areBothConfirmed(instantBetId)) {
+    if (!(await database.bets.join(instantBetId, userB)).joined) {
+      throw new Error("Synthetic instant flow failed: opponent could not join");
+    }
+    await database.deposits.confirmAndMaybeActivate(instantBetId, { role: "creator", participantId: userA });
+    const instantConfirmation = await database.deposits.confirmAndMaybeActivate(instantBetId, { role: "opponent", participantId: userB });
+    if (!instantConfirmation.activated) {
       throw new Error("Synthetic instant flow failed: deposits did not lock for both sides");
     }
-    await database.bets.activate(instantBetId);
     await database.outcomes.submit(instantBetId, userA, OUTCOME.win);
     await database.outcomes.submit(instantBetId, userB, OUTCOME.lose);
     const instantWinner = await database.outcomes.resolve(instantBetId);
     if (Number(instantWinner) !== Number(userA)) {
       throw new Error(`Synthetic instant flow failed: expected winner ${userA}, got ${instantWinner}`);
     }
-    await database.bets.finalize(instantBetId, userA, "selftest_instant");
+    const instantClaim = await database.bets.claimSettlement(instantBetId, {
+      eligibleStatuses: [BET_STATUS.confirming],
+      kind: "selftest",
+      winnerId: userA,
+    });
+    if (!instantClaim.claimed || !(await database.bets.finalizeClaimedSettlement(instantBetId, { winnerId: userA, txHash: "selftest_instant" })).finalized) {
+      throw new Error("Synthetic instant flow failed: settlement could not finalize");
+    }
 
     const oracleBetId = await database.bets.create(
       userA,
@@ -92,13 +100,14 @@ async function simulateDisputeFlow() {
       Math.floor(Date.now() / 1000) + 3600,
     );
     betIds.push(oracleBetId);
-    await database.bets.join(oracleBetId, userB);
-    await database.deposits.confirm(oracleBetId, "creator");
-    await database.deposits.confirm(oracleBetId, "opponent");
-    if (!await database.deposits.areBothConfirmed(oracleBetId)) {
+    if (!(await database.bets.join(oracleBetId, userB)).joined) {
+      throw new Error("Synthetic oracle flow failed: opponent could not join");
+    }
+    await database.deposits.confirmAndMaybeActivate(oracleBetId, { role: "creator", participantId: userA });
+    const oracleConfirmation = await database.deposits.confirmAndMaybeActivate(oracleBetId, { role: "opponent", participantId: userB });
+    if (!oracleConfirmation.activated) {
       throw new Error("Synthetic oracle flow failed: deposits did not lock for both sides");
     }
-    await database.bets.activate(oracleBetId);
     await database.outcomes.submit(oracleBetId, userA, OUTCOME.win);
     await database.outcomes.submit(oracleBetId, userB, OUTCOME.win);
     const disputeResult = await database.outcomes.resolve(oracleBetId);
@@ -114,7 +123,14 @@ async function simulateDisputeFlow() {
     if (Number(votedWinner) !== Number(userA)) {
       throw new Error(`Synthetic oracle flow failed: expected arbiter winner ${userA}, got ${votedWinner}`);
     }
-    await database.bets.finalize(oracleBetId, userA, "selftest_oracle");
+    const oracleClaim = await database.bets.claimSettlement(oracleBetId, {
+      eligibleStatuses: [BET_STATUS.oracle],
+      kind: "selftest",
+      winnerId: userA,
+    });
+    if (!oracleClaim.claimed || !(await database.bets.finalizeClaimedSettlement(oracleBetId, { winnerId: userA, txHash: "selftest_oracle" })).finalized) {
+      throw new Error("Synthetic oracle flow failed: settlement could not finalize");
+    }
 
     const instantStatus = (await database.bets.getById(instantBetId))?.status;
     const oracleStatus = (await database.bets.getById(oracleBetId))?.status;

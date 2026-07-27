@@ -4,6 +4,7 @@ import { executePayout } from "./ton.js";
 import { logger } from "./logger.js";
 import { notifyDev } from "./devNotify.js";
 import { analyzeBetDescription } from "./assistant.js";
+import { BET_STATUS } from "./states.js";
 
 let openai = null;
 const toolCache = new Map();
@@ -430,6 +431,15 @@ export async function runArbiterEngine(bet, bot) {
   const winnerId = verdict.winner_side === "creator" ? bet.creator_id : bet.opponent_id;
   const loserId = Number(winnerId) === Number(bet.creator_id) ? bet.opponent_id : bet.creator_id;
   const database = getDatabase();
+  const claim = await database.bets.claimSettlement(bet.id, {
+    eligibleStatuses: [BET_STATUS.active, BET_STATUS.confirming],
+    kind: "ai_payout",
+    winnerId,
+  });
+  if (!claim.claimed) {
+    return { status: "settlement_in_progress", winnerId, verdict };
+  }
+  const claimedBet = claim.bet;
   const winnerAddress = await database.users.getTonAddress(winnerId);
 
   logger.info(`[ENGINE] Winner: ${winnerId}, paying out...`);
@@ -437,11 +447,16 @@ export async function runArbiterEngine(bet, bot) {
   let txHash = "pending";
   if (winnerAddress) {
     try {
-      const payoutResult = await executePayout(bet.id, winnerAddress, Number(bet.amount_ton) * 2);
+      const payoutResult = await executePayout(claimedBet.id, winnerAddress, Number(claimedBet.amount_ton) * 2);
       txHash = payoutResult.txHash;
       logger.info(`[ENGINE] Payout success: ${txHash}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+        await database.bets.markSettlementFailed(claimedBet.id, message);
+      } else {
+        await database.bets.markSettlementUncertain(claimedBet.id, message);
+      }
       logger.error(`[ENGINE] Payout error: ${message}`);
       await notifyDev(`💸 AI PAYOUT FAILED\nBet: ${bet.id}\nWinner: ${winnerAddress}\nAmount: ${Number(bet.amount_ton) * 2}\nError: ${message}`);
       return {
@@ -457,7 +472,17 @@ export async function runArbiterEngine(bet, bot) {
     logger.warn(`[ENGINE] Winner ${winnerId} has no wallet address, marking payout pending`);
   }
 
-  await database.bets.finalize(bet.id, winnerId, txHash);
+  try {
+    const finalization = await database.bets.finalizeClaimedSettlement(claimedBet.id, { winnerId, txHash });
+    if (!finalization.finalized) {
+      await database.bets.markSettlementUncertain(claimedBet.id, "Payout succeeded but finalization was rejected");
+      return { status: "payout_failed", winnerId, winnerAddress, verdict, error: "Settlement finalization was rejected" };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await database.bets.markSettlementUncertain(claimedBet.id, message).catch(() => {});
+    return { status: "payout_failed", winnerId, winnerAddress, verdict, error: message };
+  }
 
   const tonscan = process.env.NETWORK === "mainnet"
     ? "https://tonscan.org"

@@ -90,7 +90,6 @@ async function sendBetShareCard(chatId, bet) {
 }
 
 async function activateBetFlow(betId) {
-  await database().bets.activate(betId);
   const bet = await database().bets.getById(betId);
   if (!bet) {
     return;
@@ -116,36 +115,100 @@ async function activateBetFlow(betId) {
 
 async function handlePayoutForBet(bet, winnerId) {
   const freshBet = await database().bets.getById(bet.id);
-  if (!freshBet || freshBet.status === BET_STATUS.done) {
+  if (!freshBet) {
     return;
   }
+
+  const claim = await database().bets.claimSettlement(freshBet.id, {
+    eligibleStatuses: [BET_STATUS.active, BET_STATUS.confirming],
+    kind: "telegram_payout",
+    winnerId,
+  });
+  if (!claim.claimed) return;
+
+  const claimedBet = claim.bet;
 
   const winnerAddress = await database().users.getTonAddress(winnerId);
-  const loserId = Number(winnerId) === Number(freshBet.creator_id) ? freshBet.opponent_id : freshBet.creator_id;
+  const loserId = Number(winnerId) === Number(claimedBet.creator_id) ? claimedBet.opponent_id : claimedBet.creator_id;
 
   if (!winnerAddress) {
-    await database().bets.finalize(freshBet.id, winnerId, "pending_address");
-    await safeNotify(bot, winnerId, `You won bet #${freshBet.id}, but your TON address is missing in the Mini App.`);
-    await safeNotify(bot, loserId, `Bet #${freshBet.id} finished. Winner payout is waiting for a wallet address.`);
+    const finalization = await database().bets.finalizeClaimedSettlement(claimedBet.id, { winnerId, txHash: "pending_address" });
+    if (!finalization.finalized) return;
+    await safeNotify(bot, winnerId, `You won bet #${claimedBet.id}, but your TON address is missing in the Mini App.`);
+    await safeNotify(bot, loserId, `Bet #${claimedBet.id} finished. Winner payout is waiting for a wallet address.`);
     return;
   }
 
-  const payoutResult = await payout({
-    betId: freshBet.id,
-    winnerAddress,
-    potTon: Number(freshBet.amount_ton) * 2,
-    oracleUsed: false,
-    arbiterAddresses: [],
-  });
-
-  await database().bets.finalize(freshBet.id, winnerId, payoutResult.winnerTxHash);
+  let payoutResult;
+  try {
+    payoutResult = await payout({
+      betId: claimedBet.id,
+      winnerAddress,
+      potTon: Number(claimedBet.amount_ton) * 2,
+      oracleUsed: false,
+      arbiterAddresses: [],
+    });
+    const finalization = await database().bets.finalizeClaimedSettlement(claimedBet.id, {
+      winnerId,
+      txHash: payoutResult.winnerTxHash,
+    });
+    if (!finalization.finalized) {
+      await database().bets.markSettlementUncertain(claimedBet.id, "Payout succeeded but finalization was rejected");
+      return;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+      await database().bets.markSettlementFailed(claimedBet.id, message);
+    } else {
+      await database().bets.markSettlementUncertain(claimedBet.id, message);
+    }
+    await notifyDev(`💸 PAYOUT FAILED\nBet: ${claimedBet.id}\nError: ${message}`);
+    return;
+  }
 
   await safeNotify(
     bot,
     winnerId,
-    `Payout for bet #${freshBet.id} was sent.\n[View on Tonscan](${TONSCAN}/tx/${payoutResult.winnerTxHash})`,
+    `Payout for bet #${claimedBet.id} was sent.\n[View on Tonscan](${TONSCAN}/tx/${payoutResult.winnerTxHash})`,
   );
-  await safeNotify(bot, loserId, `Bet #${freshBet.id} finished. The winner received the payout.`);
+  await safeNotify(bot, loserId, `Bet #${claimedBet.id} finished. The winner received the payout.`);
+}
+
+export async function refundBetWithClaim(bet, eligibleStatuses, { refundBothFn = refundBoth, refundSingleFn = refundSingle } = {}) {
+  const claim = await database().bets.claimSettlement(bet.id, {
+    eligibleStatuses,
+    kind: "expiry_refund",
+  });
+  if (!claim.claimed) return null;
+
+  const claimedBet = claim.bet;
+  const creatorAddress = await database().users.getTonAddress(claimedBet.creator_id);
+  const opponentAddress = await database().users.getTonAddress(claimedBet.opponent_id);
+  try {
+    if (claimedBet.creator_deposit && claimedBet.opponent_id && claimedBet.opponent_deposit && creatorAddress && opponentAddress) {
+      await refundBothFn(creatorAddress, opponentAddress, claimedBet.amount_ton);
+    } else if (claimedBet.creator_deposit && creatorAddress) {
+      await refundSingleFn(creatorAddress, claimedBet.amount_ton);
+    }
+    const finalization = await database().bets.finalizeClaimedSettlement(claimedBet.id, {
+      terminalStatus: BET_STATUS.refunded,
+    });
+    if (!finalization.finalized) {
+      await database().bets.markSettlementUncertain(claimedBet.id, "Refund succeeded but finalization was rejected");
+      return null;
+    }
+    return claimedBet;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (error?.beforeBroadcast || error?.code === "PRE_BROADCAST") {
+      await database().bets.markSettlementFailed(claimedBet.id, message);
+    } else {
+      await database().bets.markSettlementUncertain(claimedBet.id, message);
+    }
+    await notifyDev(`↩️ REFUND FAILED\nBet: ${claimedBet.id}\nError: ${message}`);
+    return null;
+  }
 }
 
 bot.use(async (ctx, next) => {
@@ -525,14 +588,21 @@ bot.action(/^deposit:(\d+):(creator|opponent)$/, async (ctx) => {
   }
 
   // TODO: re-enable on-chain verification after demo
-  await database().deposits.confirm(betId, role);
+  const confirmation = await database().deposits.confirmAndMaybeActivate(betId, {
+    role,
+    participantId: ctx.from.id,
+  });
+  if (!confirmation.accepted) {
+    await ctx.reply("Deposits are already closed for this bet.");
+    return;
+  }
 
   try {
     await ctx.editMessageReplyMarkup(undefined);
   } catch {
   }
 
-  if (await database().deposits.areBothConfirmed(betId)) {
+  if (confirmation.activated) {
     await activateBetFlow(betId);
     await ctx.reply("Deposit confirmed. Both deposits are in. The bet is now active.");
     return;
@@ -570,7 +640,11 @@ bot.action(/^outcome:(\d+):(win|lose)$/, async (ctx) => {
     return;
   }
 
-  await database().outcomes.submit(betId, ctx.from.id, outcome);
+  const submitted = await database().outcomes.submit(betId, ctx.from.id, outcome);
+  if (!submitted) {
+    await ctx.reply("This bet can no longer accept outcomes.");
+    return;
+  }
   const updatedBet = await database().bets.getById(betId);
 
   await ctx.reply("Your outcome was saved.");
@@ -688,35 +762,26 @@ export function startBotJobs() {
   }
 
   const expiredPending = await database().bets.getExpiredPending(now);
-
   for (const bet of expiredPending) {
     try {
-      const creatorAddress = await database().users.getTonAddress(bet.creator_id);
-      const opponentAddress = await database().users.getTonAddress(bet.opponent_id);
-      const hadCreatorDeposit = Boolean(bet.creator_deposit);
-      const hadOpponentDeposit = Boolean(bet.opponent_deposit);
-
-      if (hadCreatorDeposit && bet.opponent_id && hadOpponentDeposit && creatorAddress && opponentAddress) {
-        await refundBoth(creatorAddress, opponentAddress, bet.amount_ton);
-      } else if (hadCreatorDeposit && creatorAddress) {
-        await refundSingle(creatorAddress, bet.amount_ton);
-      }
-
-      await database().bets.refund(bet.id);
+      const refundedBet = await refundBetWithClaim(bet, [BET_STATUS.pending]);
+      if (!refundedBet) continue;
+      const hadCreatorDeposit = Boolean(refundedBet.creator_deposit);
+      const hadOpponentDeposit = Boolean(refundedBet.opponent_deposit);
       await safeNotify(
         bot,
-        bet.creator_id,
+        refundedBet.creator_id,
         hadCreatorDeposit
-          ? `⏰ Bet #${bet.id} expired with no opponent.\nYour deposit has been refunded.`
-          : `⏰ Bet #${bet.id} expired with no opponent.\nThe market has been closed automatically.`,
+          ? `⏰ Bet #${refundedBet.id} expired with no opponent.\nYour deposit has been refunded.`
+          : `⏰ Bet #${refundedBet.id} expired with no opponent.\nThe market has been closed automatically.`,
       );
-      if (bet.opponent_id) {
+      if (refundedBet.opponent_id) {
         await safeNotify(
           bot,
-          bet.opponent_id,
+          refundedBet.opponent_id,
           hadOpponentDeposit
-            ? `⏰ Bet #${bet.id} expired before activation.\nYour deposit has been refunded.`
-            : `⏰ Bet #${bet.id} expired before activation.`,
+            ? `⏰ Bet #${refundedBet.id} expired before activation.\nYour deposit has been refunded.`
+            : `⏰ Bet #${refundedBet.id} expired before activation.`,
         );
       }
     } catch (error) {
@@ -733,17 +798,11 @@ export function startBotJobs() {
         continue;
       }
 
-      const creatorAddress = await database().users.getTonAddress(bet.creator_id);
-      const opponentAddress = await database().users.getTonAddress(bet.opponent_id);
-
-      if (bet.creator_deposit && bet.opponent_deposit && creatorAddress && opponentAddress) {
-        await refundBoth(creatorAddress, opponentAddress, bet.amount_ton);
-      }
-
-      await database().bets.refund(bet.id);
-      await safeNotify(bot, bet.creator_id, `Bet #${bet.id} expired and was refunded.`);
-      if (bet.opponent_id) {
-        await safeNotify(bot, bet.opponent_id, `Bet #${bet.id} expired and was refunded.`);
+      const refundedBet = await refundBetWithClaim(bet, [BET_STATUS.active, BET_STATUS.confirming]);
+      if (!refundedBet) continue;
+      await safeNotify(bot, refundedBet.creator_id, `Bet #${refundedBet.id} expired and was refunded.`);
+      if (refundedBet.opponent_id) {
+        await safeNotify(bot, refundedBet.opponent_id, `Bet #${refundedBet.id} expired and was refunded.`);
       }
     } catch (error) {
       logger.error(`[BOT] expired bet handling failed for ${bet.id}: ${error?.name || "Error"}`);
